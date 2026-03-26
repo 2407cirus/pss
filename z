@@ -1,0 +1,3217 @@
+#include "FS.h"
+#include "SD_MMC.h"
+#include "rm67162.h"
+// #include "animation.h"
+#include <TFT_eSPI.h>
+#include <BLEDevice.h>
+#include <BLEClient.h>
+#include <AESLib.h>
+#include <TinyGPS++.h>
+#include <EEPROM.h>   // 🔴 REQUIRED (missing → EEPROM error)
+#include <HardwareSerial.h>
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+bool fireNow = true;
+float batteryVoltage = 3.6; // placeholder initial value
+// Pins
+#define PIN1 0
+#define PIN2 15
+#define PIN3 3
+#define SOS_PIN 4
+#define gnssPin 13
+#define GNSS_PIN 12
+#define SYSMODE_PIN 10
+#define pmuPin 2
+#define E22_RX_PIN 16    // ESP32-S3 RX  ← E22 TXD
+#define E22_TX_PIN 17    // ESP32-S3 TX  → E22 RXD
+#define DEVICE_ID "12345"
+// #define M0_PIN     40
+// #define M1_PIN     3
+#define SD_CLK_PIN   9
+#define SD_CMD_PIN  42
+#define SD_D0_PIN    8
+HardwareSerial e22(2);   // UART2
+String rxData = "";         // Store incoming data
+// #define lmu1Pin 12
+// #define lmu2Pin 13
+#define BAT_ADC_PIN   1     // jo ADC-capable GPIO use kar rahe ho
+#define CHG_PIN       39    // TP4056 CHRG connected here
+#define FIRE_SAFETY_PIN  37   // ✅ jo actual GPIO use ho raha ho
+#define FIREMODE_PIN  11   // ✅ jo actual GPIO use ho raha ho
+#define modeoperationpin 40
+#define FIRE_PIN     14
+// #define LED_SYS_PIN  16   // LED ON when mode = JT
+// #define LED_PULSE_PIN 3  // Pulse (500ms) whenever mode changes
+// #define TL_LED_PIN     16   // Always ON when TL mode
+// #define FIRE_CONC_LED_PIN   41     // 🔴 LED ON only in CONC
+#define TEST_OPS_PIN  21   // HIGH = TEST, LOW = OPS
+#define ADDR_G1  01
+#define ADDR_G2  0x02
+#define ADDR_G3  0x03
+#define SOS_TARGET_ADDR  0x05   // jis device ko SOS bhejna hai
+// ===============================
+unsigned long lastUserActivityTime = 0;
+bool autoSosWarning = false;
+bool autoSosTriggered = false;
+#define FIRE_POPUP_SHOW_MS 3000
+#define AUTO_SOS_TIME_MS     900000   // 1 minute
+#define AUTO_SOS_WARNING_MS 850000   // 50 seconds (10s before SOS)
+//LOGING CHANGE
+#define CONT_MAX_LOGS   1000000   // 30 Lakh (Continuous 1 month+)
+#define STATE_MAX_LOGS   500000   // 5 Lakh (10+ years realistically)
+#define SOS_MAX_LOGS     500000   // 5 Lakh SOS timeline
+uint32_t contLines = 0;
+uint32_t stateLines = 0;
+uint32_t sosLines = 0;
+bool sosLoggingActive = false;
+#define GPS_RX_PIN 44
+#define GPS_TX_PIN 43
+#define GPS_BAUD_RATE 9600
+HardwareSerial GPSSerial(1);  // Use UART1
+TinyGPSPlus gps;
+struct GPS_Data {
+  bool hasFix = false;
+  float latitude = 0.0;
+  float longitude = 0.0;
+  float altitude = 0.0;
+  float speed_knots = 0.0;
+  float speed_kmph = 0.0;
+  float course = 0.0;
+  int satellites = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  bool dataUpdated = false;
+};
+
+GPS_Data gpsData;
+void setupGPS();
+void updateGPSData();
+void printGPSData();
+String modeoperation = "TM";
+String lastModeOperation = "TM";
+unsigned long pulseStart = 0;
+bool pulseActive = false;
+unsigned long saPressStart = 0;
+bool saPressedPrev = false;
+String label = "G1";
+unsigned long lastE22Action = 0;
+bool e22TxTurn = false;   // false = RX, true = TX
+const unsigned long E22_SLOT_MS = 1000; // 1 sec
+unsigned long fireModePressStart = 0;
+bool fireModePrev = false;
+bool blockManualSOS = false;
+bool fireHolding    = false;
+// bool fireExecuted   = false;
+unsigned long firePressStart = 0;
+#define FIRE_LONG_PRESS_MS 1000
+bool fireLongPressDone = false;
+bool lastFireModeState = LOW;
+#define FIRE_POPUP_HOLD_MS 1000
+bool fireBlinkState = false;
+unsigned long fireLastBlink = 0;
+#define FIRE_BLINK_INTERVAL 300   // ms
+bool concPulseDone = false;
+unsigned long concPulseStart = 0;
+bool concPulseActive = false;
+bool fireLoraSentOnce = false;   // 🔒 ensures one-time TX
+#define CONC_PULSE_MS 300   // 300ms pulse
+bool firePopupActive = false;
+unsigned long firePopupStart = 0;
+bool sosManualTrigger = true;   // true = manual, false = auto
+const char* ACK_BACK_LM1 = "ACK_BACK_LM1";
+const char* ACK_BACK_LM2 = "ACK_BACK_LM2";
+bool gnssStealth = false;   // true = stealth (GNSS OFF)
+bool fireLoraBleSent = false;   // 🔒 one-shot fire
+// unsigned long firePressStart = 0;
+// bool fireHolding  = false;
+bool fireExecuted = false;
+uint16_t fireBtnColor = TFT_GREEN;   // ✅ default
+#define LONG_PRESS_MS 2000   // 2 second long press time (in ms)
+const char* col1[] = {"Name", "Age", "City"};
+const char* col2[] = {"Alice", "25", "Delhi"};
+const char* col3[] = {"Bob", "30", "Mumbai"};
+const char* col4[] = {"Charlie", "28", "Bangalore"};
+int rows = 3;  // number of data rows (excluding header)
+String ack_time = "--";
+String sos_time = "--";
+String latitude = "--";
+String longitude = "--";
+String HT_value  = "--";      // Row 1, Col 1
+String COG_value = "--";     // Row 2, Col 1
+String SOG_value = "--";  
+String HT_valueS  = "HT";      // Row 1, Col 1
+String COG_valueS = "COG";     // Row 2, Col 1
+String SOG_valueS = "SOG";     // Row 3, Col 1
+String FEET_value   = "Ft";   // Row 1, Col 3
+String D_value      = "DEG";      // Row 2, Col 3
+String MPS_value    = "M/S";  // Row 3, Col 3
+// Colors
+#define COLOR_GREY 0x8410 
+#define COLOR_BG          TFT_BLACK
+#define COLOR_SOS_TEXT    TFT_GREEN
+#define COLOR_SOS_OUTLINE TFT_GREEN
+#define COLOR_BTN_TEXT    TFT_GREEN
+#define COLOR_BTN_OUTLINE TFT_GREEN
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+// Replace with actual LMU1 and LMU2 MAC addresses
+// BLEAddress serverAddressLM1("28:05:A5:6F:5C:7E");  // LMU1 MAC
+BLEAddress serverAddressLM1("d4:e9:f4:a3:40:0e");  // LMU1 MAC
+BLEAddress serverAddressLM2("48:CA:43:2F:01:4D");  // LMU2 MAC (example)
+// Separate BLE clients for LMU1 and LMU2
+BLEClient* pClientLM1;
+BLEClient* pClientLM2;
+BLERemoteCharacteristic* pRxLM1;
+BLERemoteCharacteristic* pTxLM1;
+BLERemoteCharacteristic* pRxLM2;
+BLERemoteCharacteristic* pTxLM2;
+bool connectedLM1 = false;
+bool connectedLM2 = false;
+bool ackReceivedLM1 = false;
+bool ackReceivedLM2 = false;
+unsigned long lastAckTimeLM1 = 0;
+unsigned long lastAckTimeLM2 = 0;
+// bool fireNow = false;   // global state
+bool connected = false;
+bool ackReceived = true;
+bool lm1Status = false;
+bool lm2Status = false;
+String fireMode = "CONC";    // default
+unsigned long lastSend = 0;
+unsigned long lastReconnect = 0;
+unsigned long lastAckTime = 0;
+bool fireRaw = false;
+bool fireStable = false;
+unsigned long autoSosSuppressUntil = 0;
+bool lastFireRaw = false;
+unsigned long fireDebounceTime = 0;
+volatile bool sosISR_Flag = false;
+volatile unsigned long sosISR_Time = 0;
+unsigned long lastAutoSosDraw = 0;
+const unsigned long AUTO_SOS_DRAW_INTERVAL = 150;  // ms (smooth + readable)
+bool sosActive = false;          // SOS screen ON/OFF
+unsigned long sosPressStart = 0;
+#define STATE_NAME_LEN 16
+struct GNSS_State_Log {
+  uint32_t timestamp;        // seconds since midnight
+  float latitude;
+  float longitude;
+  char state[STATE_NAME_LEN];
+};
+#define STATE_LOG_MAX 1800   // 30 min @ ~1 state/sec worst case
+GNSS_State_Log stateLog[STATE_LOG_MAX];
+uint16_t stateLogIndex = 0;
+bool stateLogWrapped = false;
+#define STATE_NAME_LEN 16
+#define FIRE_DEBOUNCE_MS 40     // 40ms noise filter
+#define ACK_TIMEOUT 180000   // 3 second tak ACK nahi aaya to disconnect
+String sysModeText = "JT";   // ✅ ADD THIS LINE
+bool lastSysModeState = LOW;
+unsigned long lastSysModePress = 0;
+const unsigned long debounceSysMs = 80;
+bool ackBackSentLM1 = false;
+bool ackBackSentLM2 = false;
+// String modeoperation = "TL";   // ✅ ADD THIS LINE
+volatile bool gnssISR_Pressed = false;
+volatile unsigned long gnssISR_Time = 0;
+bool gnssTempScreenActive = false;
+unsigned long gnssScreenReleaseTime = 0;
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+#define GNSS_SCREEN_HOLD_MS 5000   // 5 seconds after release
+bool fireReleased = false;                     // Track if button was released
+const unsigned long FIRE_POPUP_DURATION = 5000; // 5 seconds
+unsigned long autoWarningStartTime = 0;
+unsigned long autoWarningLastBlink = 0;
+bool autoWarningBlinkState = true;
+unsigned long lmuDisconnectStart = 0;
+bool systemLocked = false;
+#define LMU_FAILSAFE_TIMEOUT 60000UL               // 2 minutes
+AESLib aes;
+byte aes_key[] = {
+  0x21,0x45,0x11,0x32,0x90,0xAB,0xCD,0xEF,
+  0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11
+};
+byte aes_iv[]  = {
+  0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+  0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x10
+};
+String encryptLine(String plain)
+{
+  char encrypted[256];
+
+  aes.encrypt64(
+    (byte*)plain.c_str(),
+    plain.length(),
+    encrypted,
+    aes_key,
+    128,
+    aes_iv
+  );
+
+  return String(encrypted);
+}
+// Convert bytes → HEX string
+String bytesToHex(byte *buf, int len){
+  String out = "";
+  char temp[3];
+  for(int i=0;i<len;i++){
+    sprintf(temp,"%02X",buf[i]);
+    out += temp;
+  }
+  return out;
+}
+
+// Convert HEX string → bytes
+int hexToBytes(String hex, byte *buf){
+  int len = hex.length();
+  int finalLen = len / 2;
+  for(int i=0;i<finalLen;i++){
+    buf[i] = (uint8_t) strtol(hex.substring(2*i,2*i+2).c_str(),NULL,16);
+  }
+  return finalLen;
+}
+
+
+
+// Encrypt Plain → HEX Cipher
+String encryptE22(String plain){
+  byte encrypted[256];
+
+  aes.encrypt64(
+    (byte*)plain.c_str(),
+    plain.length(),
+    (char*)encrypted,
+    aes_key,
+    128,
+    aes_iv
+  );
+
+  return bytesToHex(encrypted, plain.length());
+}
+
+
+
+// Decrypt HEX Cipher → Plain
+String decryptE22(String hexCipher) {
+
+  byte cipher[256];
+  int len = hexToBytes(hexCipher, cipher);
+
+  byte decrypted[256];
+
+  byte iv[16];
+  memcpy(iv, aes_iv, 16);     // reset IV for every decrypt
+
+  aes.decrypt64(
+    (char*)cipher,            // input must be char*
+    len,
+    decrypted,                // output must be byte*
+    aes_key,
+    128,
+    iv
+  );
+
+  decrypted[len] = '\0';
+  return String((char*)decrypted);
+}
+
+// =====================
+// BLE CALLBACKS
+// =====================
+class ClientCB_LM1 : public BLEClientCallbacks {
+  void onDisconnect(BLEClient*) {
+    connectedLM1 = false;
+    lm1Status = false;
+    Serial.println("❌ BLE LM1 Disconnected");
+  }
+};
+
+class ClientCB_LM2 : public BLEClientCallbacks {
+  void onDisconnect(BLEClient*) {
+    connectedLM2 = false;
+    lm2Status = false;
+    Serial.println("❌ BLE LM2 Disconnected");
+  }
+};
+void IRAM_ATTR sosISR() {
+  if (digitalRead(SOS_PIN) == LOW) {   // Button pressed
+    sosISR_Time = millis();
+    sosISR_Flag = true;
+  }
+}
+void IRAM_ATTR gnssISR() {
+  bool state = (digitalRead(GNSS_PIN) == LOW);  // using SOS pin as GNSS trigger
+
+  gnssISR_Pressed = state;    // true when pressed, false when released
+  gnssISR_Time = millis();    // store last edge time
+}
+uint32_t getCurrentTimeSeconds() {
+  return gpsData.hour * 3600UL +
+         gpsData.minute * 60UL +
+         gpsData.second;
+}
+void logStateChange(const char* stateName) {
+
+  GNSS_State_Log &e = stateLog[stateLogIndex];
+
+  e.timestamp = getCurrentTimeSeconds();
+
+  if (gpsData.hasFix) {
+    e.latitude  = gpsData.latitude;
+    e.longitude = gpsData.longitude;
+  } else {
+    e.latitude  = 0.0;
+    e.longitude = 0.0;
+  }
+
+  strncpy(e.state, stateName, STATE_NAME_LEN - 1);
+  e.state[STATE_NAME_LEN - 1] = '\0';
+
+  stateLogIndex++;
+  if (stateLogIndex >= STATE_LOG_MAX) {
+    stateLogIndex = 0;
+    stateLogWrapped = true;
+  }
+
+  Serial.print("📝 STATE LOGGED: ");
+  Serial.println(stateName);
+
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("❌ SD not ready");
+    return;
+  }
+
+  File f = SD_MMC.open("/state_log.csv", FILE_APPEND);
+  if (!f) {
+    Serial.println("❌ Failed to open log file");
+    return;
+  }
+
+String line =
+  String(e.timestamp) + "," +
+  String(e.latitude, 6) + "," +
+  String(e.longitude, 6) + "," +
+  String(e.state);
+
+// Encrypt and save
+String enc = encryptLine(line);
+f.println(enc);
+
+  f.close();
+  Serial.println("📁 Saved to SD");
+}
+void drawGNSSSearchingScreen() {
+
+ static float sweepAngle = 0;
+ static float pulse = 0;
+
+ int cx = 268;
+ int cy = 105;
+
+ uint16_t radar = TFT_GREEN;
+ uint16_t grid  = 0x2104;
+
+ sprite.fillSprite(TFT_BLACK);
+
+ // ==================================
+ // TACTICAL GRID
+ // ==================================
+ for (int x = 0; x < 536; x += 32)
+     sprite.drawFastVLine(x, 0, 240, grid);
+
+ for (int y = 0; y < 240; y += 32)
+     sprite.drawFastHLine(0, y, 536, grid);
+
+ // ==================================
+ // RADAR RINGS
+ // ==================================
+ sprite.drawCircle(cx, cy, 35, radar);
+ sprite.drawCircle(cx, cy, 65, radar);
+ sprite.drawCircle(cx, cy, 95, radar);
+
+ // ==================================
+ // PULSING CENTER TARGET
+ // ==================================
+ int pulseSize = 3 + sin(pulse) * 2;
+
+ sprite.drawLine(cx-12, cy, cx+12, cy, radar);
+ sprite.drawLine(cx, cy-12, cx, cy+12, radar);
+
+ sprite.fillCircle(cx, cy, pulseSize, TFT_GREENYELLOW);
+
+ // ==================================
+ // RADAR SWEEP WITH FADE
+ // ==================================
+ for(int i=0;i<12;i++)
+ {
+     float a = sweepAngle - i*2;
+
+     int x = cx + cos(a * DEG_TO_RAD) * 95;
+     int y = cy + sin(a * DEG_TO_RAD) * 95;
+
+     uint16_t col = (i==0) ? TFT_GREENYELLOW : 0x07E0;
+
+     sprite.drawLine(cx, cy, x, y, col);
+ }
+
+ // ==================================
+ // SATELLITE ORBIT
+ // ==================================
+ sprite.drawCircle(cx, cy, 65, 0x39E7);
+
+ // ==================================
+ // SATELLITES WITH GLOW
+ // ==================================
+ for(int i=0;i<5;i++)
+ {
+     float ang = millis()*0.02 + i*72;
+
+     int sx = cx + cos(ang * DEG_TO_RAD) * 65;
+     int sy = cy + sin(ang * DEG_TO_RAD) * 65;
+
+     sprite.fillCircle(sx, sy, 3, TFT_WHITE);
+     sprite.drawCircle(sx, sy, 7, TFT_CYAN);
+ }
+
+ // ==================================
+ // GNSS SEARCH ICON (📍 + 🔍)
+ // ==================================
+ int ix = cx;
+ int iy = cy - 60;
+
+ sprite.fillCircle(ix, iy, 14, TFT_RED);
+ sprite.fillCircle(ix, iy, 5, TFT_WHITE);
+
+ sprite.fillTriangle(
+     ix-8, iy+6,
+     ix+8, iy+6,
+     ix, iy+22,
+     TFT_RED
+ );
+
+ int mx = ix + 22;
+ int my = iy + 10;
+
+ sprite.drawCircle(mx, my, 9, TFT_CYAN);
+ sprite.drawLine(mx+6, my+6, mx+18, my+18, TFT_WHITE);
+
+ // ==================================
+ // STATUS BAR
+ // ==================================
+ sprite.drawFastHLine(0, 170, 536, radar);
+
+ sprite.setTextDatum(MC_DATUM);
+ sprite.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
+
+ sprite.setTextFont(4);
+ sprite.drawString("GNSS ACQUISITION", 268, 190);
+
+ sprite.setTextFont(2);
+ sprite.drawString("SCANNING SATELLITE CONSTELLATION", 268, 215);
+
+ sprite.setTextDatum(TL_DATUM);
+
+ lcd_PushColors(0,0,536,240,(uint16_t*)sprite.getPointer());
+
+ // ==================================
+ // UPDATE ANIMATION
+ // ==================================
+ sweepAngle += 3;
+ if (sweepAngle >= 360) sweepAngle = 0;
+
+ pulse += 0.15;
+}
+//--------------------------------------
+void drawTableLabels(int startX, int startY,
+                     int colW_small, int colW_big,
+                     int rowH_small, int rowH_big)
+{
+    int colW[3] = { colW_small, colW_big, colW_small };
+    int rowH[3] = { rowH_small, rowH_big, rowH_small };
+
+    int x = startX;
+    int y = startY;
+
+    // --- Row 1 ---
+    sprite.drawString(HT_valueS, x + 5, y + 20);                                // R1C1
+    sprite.drawString(FEET_value, x + colW[0] + colW[1] + 5, y + 20);          // R1C3
+
+    // --- Row 2 ---
+    sprite.drawString(COG_valueS, x + 5, y + rowH[0] + 20);                     // R2C1
+    sprite.drawString(D_value, x + colW[0] + colW[1] + 5, y + rowH[0] + 20);   // R2C3
+
+    // --- Row 3 ---
+    sprite.drawString(SOG_valueS, x + 5, y + rowH[0] + rowH[1] + 20);           // R3C1
+    sprite.drawString(MPS_value, x + colW[0] + colW[1] + 5,
+                      y + rowH[0] + rowH[1] + 20);                             // R3C3
+}
+
+void draw3x3Table_MiddleBig(int startX, int startY,
+                            int colW_small, int colW_big,
+                            int rowH_small, int rowH_big,
+                            uint16_t color)
+{
+    int colW[3] = { colW_small, colW_big, colW_small };
+    int rowH[3] = { rowH_small, rowH_big, rowH_small };
+
+    uint16_t borderColor  = color;
+    uint16_t shadowColor  = TFT_BLACK;
+
+    int y = startY;
+
+    for (int r = 0; r < 3; r++)
+    {
+        int x = startX;
+
+        for (int c = 0; c < 3; c++)
+        {
+            int w = colW[c];
+            int h = rowH[r];
+
+            // --- CLEAN DARK BACKGROUND ---
+            sprite.fillRect(x + 1, y + 1, w - 2, h - 2, shadowColor);
+
+            // --- BOLD OUTER BORDER ---
+            sprite.drawRect(x, y, w, h, borderColor);
+            sprite.drawRect(x + 1, y + 1, w - 2, h - 2, borderColor);
+
+            // ===============================
+            // ✅ DRAW VALUES IN MIDDLE COLUMN
+            // ===============================
+            if (c == 1) {   // middle column only
+                sprite.setTextDatum(MC_DATUM);
+                sprite.setTextFont(4);
+                sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+
+                String valueText = "";
+
+                if (r == 0) valueText = HT_value;    // Row 1 → HT VALUE
+                if (r == 1) valueText = COG_value;   // Row 2 → COG VALUE
+                if (r == 2) valueText = SOG_value;   // Row 3 → SOG / DEG VALUE
+
+                sprite.drawString(valueText,
+                                  x + w / 2,
+                                  y + h / 2);
+            }
+
+            x += w;
+        }
+
+        y += rowH[r];
+    }
+
+    // ---- OUTER FRAME (double line) ----
+    int totalW = colW_small + colW_big + colW_small;
+    int totalH = rowH_small + rowH_big + rowH_small;
+
+    sprite.drawRect(startX - 2, startY - 2, totalW + 4, totalH + 4, borderColor);
+    sprite.drawRect(startX - 3, startY - 3, totalW + 6, totalH + 6, borderColor);
+
+    sprite.setTextDatum(TL_DATUM);  // reset
+}
+
+
+static bool ackProcessedLM1 = false;   // 🔒 GLOBAL / STATIC LOCK
+
+
+static void notifyCB_LM1(BLERemoteCharacteristic*, uint8_t* d, size_t len, bool) {
+
+  String r = "";
+  for (int i = 0; i < (int)len; i++) r += (char)d[i];
+
+  Serial.print("📥 BLE LM1 RX: ");
+  Serial.println(r);
+
+  lastAckTimeLM1 = millis();
+  ackReceivedLM1 = true;
+  connectedLM1   = true;
+  lm1Status      = true;
+
+  // ===============================
+  // ✅ RUN ONLY ONCE (FIRST ACK)
+  // ===============================
+  if (!ackProcessedLM1 && (r == "ACK1" || r == "ACK")) {
+
+    ackProcessedLM1 = true;   // 🔒 LOCK FIRST (important)
+
+    Serial.println("✅ LMU1 ACK RECEIVED (FIRST TIME)");
+
+    char encrypted[128];
+
+    aes.encrypt64(
+      (byte*)ACK_BACK_LM1,
+      strlen(ACK_BACK_LM1),
+      encrypted,
+      aes_key,
+      128,
+      aes_iv
+    );
+
+    if (pRxLM1) {
+      pRxLM1->writeValue(
+        (uint8_t*)ACK_BACK_LM1,
+        strlen(ACK_BACK_LM1)
+      );
+      Serial.println("📤 ACK_BACK_LM1 SENT (ONCE)");
+    }
+  }
+}
+void E22_RxAliveCheck() {
+
+  static unsigned long lastPrint = 0;
+
+  // Every 1 second, show RX alive status
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    Serial.println("👂 E22 RX MODE ACTIVE");
+  }
+
+  // If actual data arrives, print it
+  while (e22.available()) {
+    char c = e22.read();
+    Serial.print("📥 E22 RX BYTE: ");
+    Serial.println(c);
+  }
+}
+
+static void notifyCB_LM2(BLERemoteCharacteristic*, uint8_t* d, size_t len, bool) {
+
+  String r = "";
+  for (int i = 0; i < (int)len; i++) r += (char)d[i];
+
+  Serial.print("📥 BLE LM2 RX: ");
+  Serial.println(r);
+
+  lastAckTimeLM2 = millis();
+  ackReceivedLM2 = true;
+  connectedLM2   = true;
+  lm2Status      = true;
+
+  // ===============================
+  // ✅ ACK RECEIVED FROM LMU2 (ONCE)
+  // ===============================
+  if ((r == "ACK2" || r == "ACK") && !ackBackSentLM2) {
+
+    Serial.println("✅ LMU2 ACK RECEIVED (FIRST TIME)");
+
+    char encrypted[128];
+
+    aes.encrypt64(
+      (byte*)ACK_BACK_LM2,
+      strlen(ACK_BACK_LM2),
+      encrypted,
+      aes_key,
+      128,
+      aes_iv
+    );
+
+    if (pRxLM2) {
+pRxLM2->writeValue(
+  (uint8_t*)ACK_BACK_LM2,
+  strlen(ACK_BACK_LM2)
+);
+      Serial.println("📤 ACK_BACK_LM2 SENT (ONCE)");
+    }
+
+    ackBackSentLM2 = true;   // 🔒 LOCK IT
+  }
+}
+
+void drawBlankScreen() {
+  sprite.fillSprite(TFT_BLACK);
+  lcd_PushColors(0, 0, 536, 240,
+                 (uint16_t*)sprite.getPointer());
+}
+
+void sendFireCommandToLMU() {
+
+  // ===============================
+  // 🔧 TEST / OPS MODE DETECTION
+  // ===============================
+  String opsMode = (digitalRead(TEST_OPS_PIN) == HIGH) ? "TEST" : "OPS";
+
+  // ===============================
+  // 🔥 FINAL FIRE COMMAND
+  // ===============================
+  String fireCmd = "FIRE+" + fireMode + "+" + opsMode;
+
+  Serial.println("================================");
+  Serial.println("🔥 SEND FIRE TO LMU (BLE)");
+  Serial.print("➡️ Command: ");
+  Serial.println(fireCmd);
+
+  char encrypted[128];
+
+  // ---------- LMU1 ----------
+  if (connectedLM1 && pRxLM1) {
+
+    aes.encrypt64(
+      (byte*)fireCmd.c_str(),
+      fireCmd.length(),
+      encrypted,
+      aes_key,
+      128,
+      aes_iv
+    );
+
+pRxLM1->writeValue(
+  (uint8_t*)fireCmd.c_str(),
+  fireCmd.length()
+);
+
+    Serial.println("✅ Sent to LMU1");
+  }
+  else {
+    Serial.println("❌ LMU1 NOT CONNECTED");
+  }
+
+  // ---------- LMU2 ----------
+  if (connectedLM2 && pRxLM2) {
+
+    aes.encrypt64(
+      (byte*)fireCmd.c_str(),
+      fireCmd.length(),
+      encrypted,
+      aes_key,
+      128,
+      aes_iv
+    );
+
+pRxLM2->writeValue(
+  (uint8_t*)fireCmd.c_str(),
+  fireCmd.length()
+);
+
+    Serial.println("✅ Sent to LMU2");
+  }
+  else {
+    Serial.println("❌ LMU2 NOT CONNECTED");
+  }
+
+  Serial.println("================================");
+}
+
+
+
+void drawAutoSOSWarning() {
+
+  const unsigned long SOLID_TIME = 2000;   // 2 sec solid
+  const unsigned long BLINK_ON   = 1000;   // 1 sec ON
+  const unsigned long BLINK_OFF  = 1000;   // 1 sec OFF
+
+  unsigned long now = millis();
+
+  // ===============================
+  // 🧠 BLINK STATE MACHINE
+  // ===============================
+  if (now - autoWarningStartTime < SOLID_TIME) {
+    autoWarningBlinkState = true;   // solid phase
+  }
+  else {
+    if (autoWarningBlinkState &&
+        now - autoWarningLastBlink >= BLINK_ON) {
+
+      autoWarningBlinkState = false;
+      autoWarningLastBlink = now;
+    }
+    else if (!autoWarningBlinkState &&
+             now - autoWarningLastBlink >= BLINK_OFF) {
+
+      autoWarningBlinkState = true;
+      autoWarningLastBlink = now;
+    }
+  }
+
+  // OFF phase → kuch draw nahi
+  if (!autoWarningBlinkState) return;
+
+  // ===============================
+  // 📦 DRAW WARNING BOX
+  // ===============================
+  int boxW = 420;
+  int boxH = 90;
+  int boxX = (536 - boxW) / 2;
+  int boxY = (240 - boxH) / 2;
+
+  sprite.fillRoundRect(boxX, boxY, boxW, boxH, 14, TFT_ORANGE);
+  sprite.drawRoundRect(boxX, boxY, boxW, boxH, 14, TFT_WHITE);
+
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextFont(4);
+  sprite.setTextColor(TFT_BLACK, TFT_ORANGE);
+
+  sprite.drawString("AUTO SOS IN 15 MINUTES", 268, boxY + 30);
+  sprite.drawString("PRESS SOS TO CANCEL", 268, boxY + 60);
+
+  sprite.setTextDatum(TL_DATUM);
+}
+
+
+
+
+void handleFirePopup(bool firePressed, bool fireSwitchAllowed) {
+
+    // Button pressed and allowed
+    if (firePressed && fireSwitchAllowed) {
+        // Show popup immediately
+        if (!firePopupActive) {
+            firePopupActive = true;
+            Serial.println("🔥 FIRE POPUP ON (button pressed)");
+        }
+        fireReleased = false; // Reset released flag while button is pressed
+    } 
+    else if (firePopupActive && !firePressed) {
+        // Button released: start 5-second timer
+        if (!fireReleased) {
+            firePopupStart = millis();  // start countdown
+            fireReleased = true;
+            Serial.println("⏳ FIRE POPUP will stay for 5 sec");
+        }
+
+        // Check if 5 seconds passed after release
+        if (millis() - firePopupStart >= FIRE_POPUP_DURATION) {
+            firePopupActive = false;  // turn off popup
+            fireReleased = false;     // reset
+            Serial.println("🔥 FIRE POPUP OFF (5 sec after release)");
+        }
+    }
+}
+
+void drawLowBatteryScreen(int percent, float voltage) {
+
+    sprite.fillSprite(TFT_BLACK);
+
+    uint16_t white = TFT_WHITE;
+    uint16_t red   = TFT_RED;
+
+    int cx = 536 / 2;
+    int cy = 240 / 2;
+
+    // Battery icon size
+    int bw = 220;
+    int bh = 100;
+    int bx = cx - (bw / 2);
+    int by = cy - (bh / 2);
+
+    // -----------------------------------
+    // BATTERY OUTLINE
+    // -----------------------------------
+    sprite.drawRoundRect(bx, by, bw, bh, 12, white);
+
+    // Battery positive terminal
+    sprite.fillRect(bx + bw, by + (bh / 2 - 18), 14, 36, white);
+
+    // Low battery left block (like your icon)
+    sprite.fillRoundRect(bx + 10, by + 15, 40, 70, 6, red);
+
+    // -----------------------------------
+    // RED WARNING TRIANGLE
+    // -----------------------------------
+    int tx = bx + 70;
+    int ty = by + 15;
+
+    sprite.fillTriangle(
+        tx + 10, ty + 70,
+        tx + 50, ty + 0,
+        tx + 90, ty + 70,
+        red
+    );
+
+    // Exclamation mark (white)
+    sprite.fillRect(tx + 47, ty + 22, 6, 28, white);  // vertical bar
+    sprite.fillCircle(tx + 50, ty + 57, 5, white);    // dot
+
+    // -----------------------------------
+    // PUSH DISPLAY
+    // -----------------------------------
+    lcd_PushColors(0, 0, 536, 240, (uint16_t*)sprite.getPointer());
+}
+
+#define GREY_MAIN   0x8410   // medium grey
+#define GREY_DARK   0x4208   // dark grey
+#define GREY_LIGHT  0xC618   // light grey
+
+
+void drawSOSScreen(String ack_time, String sos_time, String latitude, String longitude, bool sos_pin_high,bool isManual) { 
+    static bool blink_on = false;
+    blink_on = !blink_on;
+
+    const int center_x = 268;
+    const int center_y = 120;
+
+    const int bar_thickness  = 5;
+    const int letter_height = 25;
+    const int letter_width  = 20;
+    const int spacing       = 7;
+    const int total_width   = (3 * letter_width) + (2 * spacing);
+
+    const int sos_up_offset = 18;  
+    int current_x = center_x - (total_width / 2); 
+    const int base_y = center_y - (letter_height / 2) - sos_up_offset;
+
+    sprite.fillSprite(TFT_BLACK);
+
+    const int cell_w        = 190;      
+    const int cell_h        = 60;       
+    const int cell_spacing = 10; 
+    const int table_up_offset = 20;
+
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(GREY_LIGHT, TFT_BLACK);
+
+    // ================= LEFT BIG TABLE =================
+    int table_left_x = current_x - cell_w - 40; 
+    int table_y = center_y - (cell_h*2 + cell_spacing)/2 - table_up_offset;
+
+    sprite.drawRect(table_left_x, table_y, cell_w, cell_h, GREY_MAIN);                   
+    sprite.setTextFont(4);
+    sprite.drawString("SOS INITIATION",
+                      table_left_x + cell_w/2,
+                      table_y + cell_h/2); 
+
+    sprite.drawRect(table_left_x,
+                    table_y + cell_h + cell_spacing,
+                    cell_w,
+                    cell_h,
+                    GREY_MAIN);
+  sprite.drawString(isManual ? "MANUAL" : "AUTO",
+                  table_left_x + cell_w/2,
+                  table_y + cell_h + cell_spacing + cell_h/2);
+
+
+    // ================= RIGHT 1×2 TABLES =================
+    int table_right_x = center_x + total_width/2 + 40; 
+
+    // -------- SOS | TIME --------
+    {
+        int x = table_right_x;
+        int y = table_y;
+        int w = cell_w;
+        int h = cell_h;
+        int midX = x + w/2;
+
+        sprite.drawRect(x, y, w, h, GREY_MAIN);
+        sprite.drawLine(midX, y, midX, y + h, GREY_MAIN);
+
+        sprite.setTextFont(4);
+        sprite.drawString("SOS", x + w/4, y + h/2);
+
+        sprite.setTextFont(4);
+        sprite.drawString(sos_time, x + (3*w)/4, y + h/2);
+    }
+
+    // -------- ACK | TIME --------
+    {
+        int x = table_right_x;
+        int y = table_y + cell_h + cell_spacing;
+        int w = cell_w;
+        int h = cell_h;
+        int midX = x + w/2;
+
+        sprite.drawRect(x, y, w, h, GREY_MAIN);
+        sprite.drawLine(midX, y, midX, y + h, GREY_MAIN);
+
+        sprite.setTextFont(4);
+        sprite.drawString("ACK", x + w/4, y + h/2);
+
+        sprite.setTextFont(4);
+        sprite.drawString(ack_time, x + (3*w)/4, y + h/2);
+    }
+
+    // ================= BLINKING SOS ICON =================
+    if (blink_on) {
+        const int outer_ring_radius = 55;
+        const int inner_ring_radius = 51;
+        const int red_circle_radius = 48;
+
+        uint16_t ring_color = sos_pin_high ? GREY_MAIN : GREY_LIGHT;
+
+        sprite.drawCircle(center_x, center_y - sos_up_offset,
+                          outer_ring_radius, ring_color);
+        sprite.drawCircle(center_x, center_y - sos_up_offset,
+                          inner_ring_radius, ring_color); 
+        sprite.fillCircle(center_x, center_y - sos_up_offset,
+                          red_circle_radius, GREY_DARK); 
+
+        current_x = center_x - (total_width / 2);
+
+        // S
+        sprite.fillRect(current_x, base_y,
+                        letter_width, bar_thickness, TFT_WHITE); 
+        sprite.fillRect(current_x, base_y,
+                        bar_thickness, letter_height/2, TFT_WHITE); 
+        sprite.fillRect(current_x,
+                        base_y + (letter_height/2) - (bar_thickness/2),
+                        letter_width, bar_thickness, TFT_WHITE); 
+        sprite.fillRect(current_x + letter_width - bar_thickness,
+                        base_y + (letter_height/2),
+                        bar_thickness, letter_height/2, TFT_WHITE); 
+        sprite.fillRect(current_x,
+                        base_y + letter_height - bar_thickness,
+                        letter_width, bar_thickness, TFT_WHITE);
+
+        current_x += letter_width + spacing;
+
+        // 
+        sprite.fillRect(current_x, base_y,
+                        letter_width, bar_thickness, TFT_WHITE); 
+        sprite.fillRect(current_x,
+                        base_y + letter_height - bar_thickness,
+                        letter_width, bar_thickness, TFT_WHITE);
+        sprite.fillRect(current_x, base_y,
+                        bar_thickness, letter_height, TFT_WHITE);
+        sprite.fillRect(current_x + letter_width - bar_thickness,
+                        base_y,
+                        bar_thickness, letter_height, TFT_WHITE);
+
+        current_x += letter_width + spacing;
+
+        //     
+        sprite.fillRect(current_x, base_y,
+                        letter_width, bar_thickness, TFT_WHITE); 
+        sprite.fillRect(current_x, base_y,
+                        bar_thickness, letter_height/2, TFT_WHITE); 
+        sprite.fillRect(current_x,
+                        base_y + (letter_height/2) - (bar_thickness/2),
+                        letter_width, bar_thickness, TFT_WHITE); 
+        sprite.fillRect(current_x + letter_width - bar_thickness,
+                        base_y + (letter_height/2),
+                        bar_thickness, letter_height/2, TFT_WHITE); 
+        sprite.fillRect(current_x,
+                        base_y + letter_height - bar_thickness,
+                        letter_width, bar_thickness, TFT_WHITE);
+    }
+
+    // ================= BOTTOM 1×2 TABLES =================
+    int bottom_cell_w = 276;      
+    int bottom_cell_h = 54;
+    int bottom_table_y = 240 - bottom_cell_h - 10; 
+    int bottom_left_x = 2;
+    int bottom_right_x = 536/2 + 10;
+
+    // -------- LAT | VALUE --------
+    {
+        int x = bottom_left_x;
+        int y = bottom_table_y;
+        int w = bottom_cell_w - 20;
+        int h = bottom_cell_h;
+        int label_w = 67;            
+        int value_w = w - label_w;   
+        int midX = x + label_w;
+
+        sprite.drawRect(x, y, w, h, TFT_WHITE);
+        sprite.drawLine(midX, y, midX, y + h, TFT_WHITE);
+
+        sprite.setTextFont(4);
+        sprite.drawString("LAT", x + label_w/2, y + h/2);
+        sprite.drawString(latitude, x + label_w + value_w/2, y + h/2);
+    }
+
+    // -------- LON | VALUE --------
+    {
+        int x = bottom_right_x;
+        int y = bottom_table_y;
+        int w = bottom_cell_w - 20;
+        int h = bottom_cell_h;
+        int label_w = 67;            
+        int value_w = w - label_w;   
+        int midX = x + label_w;
+
+        sprite.drawRect(x, y, w, h, TFT_WHITE);
+        sprite.drawLine(midX, y, midX, y + h, TFT_WHITE);
+
+        sprite.setTextFont(4);
+        sprite.drawString("LON", x + label_w/2, y + h/2);
+        sprite.drawString(longitude, x + label_w + value_w/2, y + h/2);
+    }
+
+    lcd_PushColors(0, 0, 536, 240, (uint16_t*)sprite.getPointer());
+}
+
+
+void updateFireButton() {
+  bool reading = (digitalRead(FIRE_PIN) == LOW);  // LOW = pressed (PULLUP logic)
+
+  if (reading != lastFireRaw) {
+    fireDebounceTime = millis();   // reset timer on change
+  }
+
+  if ((millis() - fireDebounceTime) > FIRE_DEBOUNCE_MS) {
+    fireStable = reading;
+  }
+
+  lastFireRaw = reading;
+}
+
+// =====================
+// BLE CONNECT
+// =====================
+bool connectServerLM1() {
+  Serial.println("🔄 Connecting to LMU1 ...");
+
+  pClientLM1 = BLEDevice::createClient();
+  pClientLM1->setClientCallbacks(new ClientCB_LM1());
+
+  if (!pClientLM1->connect(serverAddressLM1)) {
+    Serial.println("❌ LMU1 Connect Failed");
+    return false;
+  }
+
+  BLERemoteService* s = pClientLM1->getService(SERVICE_UUID);
+  if (!s) return false;
+
+  pRxLM1 = s->getCharacteristic(RX_UUID);
+  pTxLM1 = s->getCharacteristic(TX_UUID);
+
+  if (!pRxLM1 || !pTxLM1) return false;
+
+  pTxLM1->registerForNotify(notifyCB_LM1);
+
+  connectedLM1 = true;
+  ackReceivedLM1 = false;
+  lastAckTimeLM1 = millis();
+  lm1Status = false;
+
+  Serial.println("✅ LMU1 Connected, Waiting for ACK...");
+
+  // Send initial ping
+  const char* ping = "REQ_LM1";
+  pRxLM1->writeValue((uint8_t*)ping, strlen(ping));
+
+  return true;
+}
+
+bool connectServerLM2() {
+  Serial.println("🔄 Connecting to LMU2 ...");
+
+  pClientLM2 = BLEDevice::createClient();
+  pClientLM2->setClientCallbacks(new ClientCB_LM2());
+
+  if (!pClientLM2->connect(serverAddressLM2)) {
+    Serial.println("❌ LMU2 Connect Failed");
+    return false;
+  }
+
+  BLERemoteService* s = pClientLM2->getService(SERVICE_UUID);
+  if (!s) return false;
+
+  pRxLM2 = s->getCharacteristic(RX_UUID);
+  pTxLM2 = s->getCharacteristic(TX_UUID);
+
+  if (!pRxLM2 || !pTxLM2) return false;
+
+  pTxLM2->registerForNotify(notifyCB_LM2);
+
+  connectedLM2 = true;
+  ackReceivedLM2 = false;
+  lastAckTimeLM2 = millis();
+  lm2Status = false;
+
+  Serial.println("✅ LMU2 Connected, Waiting for ACK...");
+
+  // Send initial ping
+  const char* ping = "REQ_LM2";
+  pRxLM2->writeValue((uint8_t*)ping, strlen(ping));
+
+  return true;
+}
+
+bool sosBlinkState = false;
+unsigned long sosLastBlink = 0;
+const int sosBlinkInterval = 300;   // ms (blink speed)
+
+
+float readBatteryVoltage() {
+  int raw = analogRead(BAT_ADC_PIN);   // 0..4095
+
+  // 🔒 Floating pin filter:
+  // agar bohot chhota raw hai, assume no battery / no signal
+  if (raw < 50) {   // threshold adjust kar sakte ho
+    return 0.0;     // No battery / no reading
+  }
+
+  float vAdc = (raw / 4095.0f) * 3.3f; // ADC pin voltage (0–3.3V)
+  float vBat = vAdc * 2.0f;            // divider ×2
+
+  return vBat;
+}
+
+int getBatteryPercent(float vBat) {
+  if (vBat <= 0.1f) return 0;   // no battery detected
+  if (vBat >= 4.10f) return 100;
+  if (vBat <= 3.35f) return 0;
+
+  float percent = (vBat - 3.35f) * 100.0 / (4.10f - 3.35f);
+  return constrain((int)percent, 0, 100);
+}
+
+
+
+// ---------------- Helper Functions ----------------
+void drawCenteredText(const String &s, int x, int y, uint8_t font = 2, uint16_t color = TFT_WHITE) {
+  sprite.setTextFont(font);        // built-in font 1..8
+  sprite.setTextColor(color, COLOR_BG);
+  sprite.setTextDatum(MC_DATUM);   // center
+  sprite.drawString(s, x, y);
+  sprite.setTextDatum(TL_DATUM);   // reset to top-left
+}
+void drawPMURouterIcon(int cx, int cy, bool connected, const char *label)
+{
+    // Use HIGH/LOW for readability, though 'connected' is a bool
+    // The library uses uint16_t for colors (16-bit)
+    uint16_t col = (connected) ? TFT_GREEN : COLOR_GREY;
+    // uint16_t WHITE = TFT_WHITE; // White is not used in the original logic
+
+    // --- Hotspot Center Dot ---
+    // The center dot is a solid circle with a radius of 6 pixels.
+    sprite.fillCircle(cx, cy, 4, col);
+
+    // The original code uses a 4-pixel thickness for the arcs (12-8=4, 18-14=4, 24-20=4).
+
+    // ---- Left Side Arcs (UPWARD Hotspot Style: 90 to 180 degrees) ----
+    // Arcs cover the upper-left quadrant
+    // The center is slightly offset to the left (cx - 1)
+    sprite.drawArc(cx - 1, cy, 15, 9, 60, 120, col, COLOR_BG);
+    sprite.drawArc(cx - 1, cy, 26, 20, 60, 120, col, COLOR_BG);
+    sprite.drawArc(cx - 1, cy, 37, 31, 60, 120, col, COLOR_BG);
+
+    // ---- Right Side Arcs (UPWARD Hotspot Style: 0 to 90 degrees) ----
+    // Arcs cover the upper-right quadrant
+    // The center is slightly offset to the right (cx + 1)
+    sprite.drawArc(cx + 1, cy, 15, 9, 240, 300, col, COLOR_BG); // Arc 1 (7px thick)
+    sprite.drawArc(cx + 1, cy, 26, 20, 240, 300, col, COLOR_BG); // Arc 2 (4px thick)
+    sprite.drawArc(cx + 1, cy, 37, 31, 240, 300, col, COLOR_BG); // Arc 3 (4px thick)
+
+    // ---- Label ----
+    // Label is drawn 35 pixels below the center, font size 4.
+    drawCenteredText(label, cx, cy + 60, 4, col);
+}
+
+void fullScreenDefenseBoot_RectangleLoading()
+{
+    // ---------- CREATE SPRITE ----------
+    sprite.createSprite(536, 240);
+    sprite.fillSprite(TFT_BLACK);
+
+    // ---------- DRAW TECH GRID ----------
+    for (int x = 0; x < 536; x += 26)
+        sprite.drawFastVLine(x, 0, 240, 0x3186);
+    for (int y = 0; y < 240; y += 26)
+        sprite.drawFastHLine(0, y, 536, 0x3186);
+
+    // ---------- IMPROVED BLOCK LETTER PARAMETERS ----------
+    const uint16_t color = TFT_GREEN;
+    const int bar = 9;          // refined thickness
+    const int h   = 54;         // bit taller
+    const int gap = 14;         // uniform spacing
+
+    const int wP = 42;
+    const int wHy = 22;
+    const int wS = 42;
+    const int wI = 12;
+    const int wM = 56;
+
+    const int totalW = wP + wHy + wS + wI + wM + 4 * gap;
+    int x = 268 - totalW / 2;
+    const int y = 120 - h / 2 -20;
+    const int midY = y + h / 2 - bar / 2;
+
+    // ==================== DRAW P ====================
+    sprite.fillRect(x, y, bar, h, color);            // left stem
+    sprite.fillRect(x, y, wP, bar, color);           // top
+    sprite.fillRect(x, midY, wP, bar, color);        // middle
+    sprite.fillRect(x + wP - bar, y,
+                    bar, h / 2, color);              // right upper loop
+    x += wP + gap;
+
+    // ==================== DRAW - ====================
+    sprite.fillRect(x, midY, wHy, bar, color);
+    x += wHy + gap;
+
+    // ==================== DRAW S ====================
+    sprite.fillRect(x, y, wS, bar, color);           // top
+    sprite.fillRect(x, y, bar, h / 2, color);        // left top
+    sprite.fillRect(x, midY, wS, bar, color);        // middle
+    sprite.fillRect(x + wS - bar, midY,
+                    bar, h / 2, color);              // right bottom
+    sprite.fillRect(x, y + h - bar, wS, bar, color); // bottom
+    x += wS + gap;
+
+    // ==================== DRAW I ====================
+    sprite.fillRect(x, y, wI, h, color);
+    x += wI + gap;
+
+    // ==================== DRAW M (CLEAN DIAGONALS) ====================
+    sprite.fillRect(x, y, bar, h, color);                // left stem
+    sprite.fillRect(x + wM - bar, y, bar, h, color);    // right stem
+
+    int diagLen = wM / 2 - bar;
+    for (int i = 0; i < diagLen; i++)
+    {
+        sprite.fillRect(x + bar + i,
+                        y + i,
+                        bar,
+                        bar,
+                        color);
+
+        sprite.fillRect(x + wM - bar - i - bar,
+                        y + i,
+                        bar,
+                        bar,
+                        color);
+    }
+
+    // ==================== BOTTOM TEXT ====================
+    sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+    sprite.setTextFont(4);
+
+    sprite.setTextDatum(BL_DATUM);
+    sprite.drawString("CIRUS", 8, 235);
+
+    sprite.setTextDatum(BR_DATUM);
+    sprite.drawString("MADE IN INDIA", 531, 235);
+
+    lcd_PushColors(0, 0, 536, 240, (uint16_t*)sprite.getPointer());
+    delay(2000);
+
+    // ==================== LOADING BAR ====================
+    int progress = 0;
+
+    while (progress <= 100)
+    {
+        sprite.fillSprite(TFT_BLACK);
+
+        for (int xg = 0; xg < 536; xg += 26)
+            sprite.drawFastVLine(xg, 0, 240, 0x3186);
+        for (int yg = 0; yg < 240; yg += 26)
+            sprite.drawFastHLine(0, yg, 536, 0x3186);
+
+        // -------- TITLE --------
+     // -------- TITLE (FONT ONLY, 18pt FIXED) --------
+sprite.setTextDatum(MC_DATUM);
+sprite.setFreeFont(&FreeSansBold18pt7b);   // ✅ 18pt font fixed
+sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+sprite.drawString("CIRUS TECHO SYSTEM", 268, 40);
+// ================= SUBTEXT (RIGHT VIEW) =================
+sprite.setFreeFont(&FreeSansBold9pt7b);   // smaller font
+sprite.setTextColor(0x8410, TFT_BLACK);   // grey color (professional look)
+sprite.drawString("RIGHT VIEW", 140, 80); // 👈 BELOW TITLE
+// ==================== BOTTOM SOS BUTTON ====================
+// ==================== PANEL BASE ====================
+// int panelX = 80;
+// int panelY = 100;
+// int panelW = 380;
+// int panelH = 100;
+
+// // ================= PANEL =================
+// sprite.fillRoundRect(panelX + 4, panelY + 4, panelW, panelH, 12, 0x2104); // shadow
+// sprite.fillRoundRect(panelX, panelY, panelW, panelH, 12, 0x8410);         // body
+// sprite.fillRoundRect(panelX, panelY, panelW, 18, 12, 0xA514);              // top highlight
+
+// // ================= SMALL BUTTON (F-MODE) =================
+// int b1x = panelX + 60;
+// int by  = panelY + 60;
+// int r1  = 14;
+
+// sprite.fillCircle(b1x, by, r1, 0x4208);
+// sprite.fillCircle(b1x, by, r1 - 4, TFT_BLACK);
+// sprite.fillCircle(b1x - 3, by - 3, 4, TFT_WHITE);
+
+// sprite.setTextFont(2);
+// sprite.setTextDatum(MC_DATUM);
+// sprite.setTextColor(TFT_BLACK, 0x8410);
+// sprite.drawString("F-MODE", b1x, panelY + panelH - 15);
+
+// // ================= SMALL BUTTON (JOINT) =================
+// int b2x = panelX + 140;
+
+// sprite.fillCircle(b2x, by, r1, 0x4208);
+// sprite.fillCircle(b2x, by, r1 - 4, TFT_BLACK);
+// sprite.fillCircle(b2x - 3, by - 3, 4, TFT_WHITE);
+
+// sprite.drawString("JOINT", b2x, panelY + panelH - 15);
+
+// // ================= BIG SOS BUTTON (UPDATED) =================
+// int sosX = panelX + panelW - 80;
+// int sosY = panelY + 55;
+// int r2   = 32;
+
+// // 🔘 Outer metal ring
+// sprite.fillCircle(sosX, sosY, r2 + 5, 0x4208);
+
+// // 🔘 Mid layer (depth)
+// sprite.fillCircle(sosX, sosY, r2, 0x8410);
+
+// // 🔘 Inner black cap (real button look)
+// sprite.fillCircle(sosX, sosY, r2 - 8, TFT_BLACK);
+
+// // 🔘 Top highlight (light reflection)
+// sprite.fillCircle(sosX - 10, sosY - 12, 6, TFT_WHITE);
+
+// // 🔘 Bottom shadow (depth)
+// sprite.fillCircle(sosX + 8, sosY + 10, 8, 0x2104);
+
+// // 🔘 TEXT (shifted DOWN)
+// sprite.setTextDatum(MC_DATUM);
+// sprite.setTextFont(2);
+// sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+// sprite.drawString("SOS", sosX, sosY + 6);   // 👈 moved down
+
+int panelX = 80;
+int panelY = 100;
+int panelW = 380;
+int panelH = 100;
+
+// ================= PANEL =================
+sprite.fillRoundRect(panelX + 4, panelY + 4, panelW, panelH, 12, 0x2104); // shadow
+sprite.fillRoundRect(panelX, panelY, panelW, panelH, 12, 0x8410);         // body
+sprite.fillRoundRect(panelX, panelY, panelW, 18, 12, 0xA514);              // top highlight
+
+// ================= SMALL BUTTON (F-MODE) =================
+int b1x = panelX + 60;
+int by  = panelY + 60;
+int r1  = 14;
+
+sprite.fillCircle(b1x, by, r1, 0x4208);
+sprite.fillCircle(b1x, by, r1 - 4, TFT_BLACK);
+sprite.fillCircle(b1x - 3, by - 3, 4, TFT_WHITE);
+
+// sprite.setTextFont(2);
+// sprite.setTextDatum(MC_DATUM);
+// sprite.setTextColor(TFT_BLACK, 0x8410);
+// sprite.drawString("F-MODE", b1x, panelY + panelH - 15);
+
+// ================= SMALL BUTTON (JOINT) =================
+// int b2x = panelX + 140;
+
+// sprite.fillCircle(b2x, by, r1, 0x4208);
+// sprite.fillCircle(b2x, by, r1 - 4, TFT_BLACK);
+// sprite.fillCircle(b2x - 3, by - 3, 4, TFT_WHITE);
+
+// sprite.drawString("JOINT", b2x, panelY + panelH - 15);
+
+// // ================= BIG SOS BUTTON (UPDATED) =================
+// int sosX = panelX + panelW - 80;
+// int sosY = panelY + 55;
+// int r2   = 32;
+
+// ================= SWITCH STYLE BUTTONS =================
+int switchY = panelY + 40;
+
+// ---------- POWER SWITCH ----------
+int pX = panelX + 30;
+
+// label
+sprite.setTextFont(2);
+sprite.setTextColor(TFT_BLACK, 0x8410);
+sprite.drawString("POWER", pX, panelY + panelH - 15);
+
+// switch body
+sprite.fillRoundRect(pX - 15, switchY - 10, 40, 18, 4, 0x4208);
+
+// toggle knob
+sprite.fillCircle(pX + 10, switchY - 1, 6, TFT_WHITE);
+
+// ON text
+sprite.drawString("ON", pX + 35, switchY - 5);
+
+
+// ---------- STEALTH SWITCH ----------
+int sX = panelX + 140;
+
+sprite.drawString("STEALTH", sX, panelY + panelH - 15);
+
+// vertical switch slot
+sprite.fillRect(sX, switchY - 12, 10, 24, 0x4208);
+
+// slider
+sprite.fillRect(sX, switchY - 10, 10, 10, TFT_WHITE);
+
+// ON text
+sprite.drawString("ON", sX + 20, switchY - 10);
+
+
+// ---------- DESIGN SWITCH ----------
+int dX = panelX + 240;
+
+sprite.drawString("DESIG.", dX, panelY + panelH - 15);
+
+// slot
+sprite.fillRect(dX, switchY - 12, 10, 24, 0x4208);
+
+// toggle (top = TL, bottom = TM)
+sprite.fillRect(dX, switchY - 12, 10, 10, TFT_WHITE);
+
+// labels
+sprite.drawString("TL", dX + 20, switchY - 12);
+sprite.drawString("TM", dX + 20, switchY + 2);
+
+        // -------- LOADING BAR --------
+        int barW = 460;
+        int barH = 38;
+        int bx = (536 - barW) / 2;
+        int by1 = 215;
+        int segments = 20;
+        int filled = segments * progress / 100;
+        int segW = (barW - (segments - 1) * 4) / segments;
+
+        for (int i = 0; i < segments; i++)
+        {
+            uint16_t col = (i < filled) ? TFT_GREEN : 0x3186;
+            sprite.fillRoundRect(bx + i * (segW + 4),
+                                 by1,
+                                 segW,
+                                 barH,
+                                 4,
+                                 col);
+        }
+
+        // -------- PERCENTAGE --------
+        sprite.setTextDatum(MC_DATUM);
+        sprite.setTextFont(4);
+        sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+
+        lcd_PushColors(0, 0, 536, 240,
+                       (uint16_t*)sprite.getPointer());
+
+        progress += 1;
+        delay(100);
+    }
+}
+
+// Battery icon
+void drawBatteryIcon(int x, int y, int w, int h, float voltage)
+{
+  float batteryPercent = map(voltage * 100, 330, 420, 0, 100);
+  batteryPercent = constrain(batteryPercent, 0, 100);
+
+  // Outer Border
+  sprite.drawRoundRect(x, y, w, h, 4, TFT_WHITE);
+
+  // Battery Tip
+  sprite.fillRoundRect(x + w + 2, y + h / 3, 5, h / 3, 2, TFT_WHITE);
+
+  // Decide Color
+  uint16_t col;
+  if (batteryPercent < 20) col = TFT_RED;
+  else if (batteryPercent < 50) col = TFT_YELLOW;
+  else col = TFT_GREEN;
+
+  // Segment Settings
+  int segments = 4;
+  int gap = 3;
+  int segW = (w - 8 - (gap * (segments - 1))) / segments;
+  int segH = h - 8;
+
+  int activeSegments = 0;
+  if (batteryPercent > 80) activeSegments = 4;
+  else if (batteryPercent > 60) activeSegments = 3;
+  else if (batteryPercent > 40) activeSegments = 2;
+  else if (batteryPercent > 15) activeSegments = 1;
+
+  // Draw Segments
+  for (int i = 0; i < segments; i++) {
+    int sx = x + 5 + i * (segW + gap);
+    int sy = y + 5;
+
+    // Empty Segment Border
+    sprite.drawRect(sx, sy, segW, segH, TFT_DARKGREY);
+
+    // Filled Segment
+    if (i < activeSegments) {
+      sprite.fillRect(sx + 1, sy + 1, segW - 2, segH - 2, col);
+    }
+  }
+// Percentage Text at bottom-left
+// sprite.setTextSize(2);
+sprite.setTextColor(TFT_GREEN); // now the text is green
+sprite.setTextDatum(BL_DATUM);
+// sprite.drawString(String((int)batteryPercent) + "%", x, y + h + 2);
+
+  // Percentage Text (optional)
+     drawCenteredText(String((int)batteryPercent) + "%", x + w/4 , y + h + 27, 4);
+}
+
+void drawGNSSIcon_Target(int x, int y, bool gnssLock)
+{
+  uint16_t ACTIVE_GREEN = TFT_GREEN;
+  uint16_t INACTIVE     = 0x4208;   // dark gray
+  uint16_t WHITE        = TFT_WHITE;
+
+  uint16_t col = gnssLock ? ACTIVE_GREEN : INACTIVE;
+
+  int outerR = 26;
+  int innerR = 16;
+  int coreR  = 5;
+
+  // ---- Outer Rings ----
+  sprite.drawCircle(x, y, outerR, col);
+  sprite.drawCircle(x, y, innerR, col);
+
+  // ---- Center Core ----
+  sprite.fillCircle(x, y, coreR, col);
+
+  // ---- Filled Target Circle (instead of multi colors)
+  sprite.fillCircle(x, y, innerR - 1, col);
+
+  // ---- Cross Arms ----
+  sprite.fillRect(x - 3, y - outerR - 8, 6, 10, col);   // Top
+  sprite.fillRect(x - 3, y + outerR - 2, 6, 10, col);   // Bottom
+  sprite.fillRect(x - outerR - 8, y - 3, 10, 6, col);   // Left
+  sprite.fillRect(x + outerR - 2, y - 3, 10, 6, col);   // Right
+
+  // ---- Border Re-Draw for Sharp Look ----
+  sprite.drawCircle(x, y, outerR, WHITE);
+  sprite.drawCircle(x, y, innerR, WHITE);
+
+  // ---- GNSS Label (Bold White) ----
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextFont(4);
+  sprite.setTextColor(TFT_GREEN, COLOR_BG);
+
+  int ty = y + outerR + 35;
+  sprite.drawString("GNSS", x - 1, ty);
+  sprite.drawString("GNSS", x + 1, ty);
+  sprite.drawString("GNSS", x, ty - 1);
+  sprite.drawString("GNSS", x, ty + 1);
+  sprite.drawString("GNSS", x, ty);
+
+  sprite.setTextDatum(TL_DATUM);
+}
+
+
+
+void drawWifiArcIcon(int cx, int cy, int strength, const char *label) {
+
+  // Colors
+  uint16_t colActive;
+  if (strength >= 3) colActive = TFT_GREEN;
+  else if (strength == 2) colActive = TFT_ORANGE;
+  else colActive = TFT_RED;
+
+  uint16_t colInactive = COLOR_GREY;  // soft grey
+  uint16_t bg = COLOR_BG;
+
+  int thick = 4;  // arc thickness (phone-style)
+
+  // Arc radii (phone-like)
+  int R1 = 32;   // outer arc
+  int R2 = 24;   // mid arc
+  int R3 = 16;   // inner arc
+  int dotR = 5;  // center dot
+
+  // Angles for nice phone-style 90° arc
+  int A1 = 140;    // start angle
+  int A2 = 220;    // end angle
+
+  // --- CENTER DOT ---
+  sprite.fillCircle(cx, cy, dotR, (strength >= 1 ? colActive : colInactive));
+
+  // --- OUTER ARCS ---
+  // Arc 1 (outer)
+  sprite.drawArc(cx, cy, R1, R1 - thick,
+                 A1, A2,
+                 (strength >= 4 ? colActive : colInactive),
+                 bg);
+
+  // Arc 2 (middle)
+  sprite.drawArc(cx, cy, R2, R2 - thick,
+                 A1, A2,
+                 (strength >= 3 ? colActive : colInactive),
+                 bg);
+
+  // Arc 3 (inner)
+  sprite.drawArc(cx, cy, R3, R3 - thick,
+                 A1, A2,
+                 (strength >= 2 ? colActive : colInactive),
+                 bg);
+
+  // Label under icon
+  drawCenteredText(label, cx, cy + 48, 4, colActive);
+}
+
+
+
+void drawGButton_Circle(int x, int y, int r)
+{
+  uint16_t BLACK = TFT_BLACK;
+  uint16_t GREEN = TFT_GREEN;
+  uint16_t WHITE = TFT_WHITE;
+  uint16_t GREY  = 0x8410; // standard grey color
+
+  uint16_t circleColor = BLACK;
+  uint16_t lineColor = GREY;  // default line is GREY
+
+  // ============================
+  // 🔹 SELECT LABEL BASED ON PINS
+  // ============================
+  if (digitalRead(PIN1) == LOW) {
+    label = "G2";
+  }
+  else if (digitalRead(PIN2) == LOW) {
+    label = "G1";
+  }
+  else if (digitalRead(PIN3) == LOW) {
+    label = "G3";
+  }
+
+  // ============================
+  // 🔸 SYSTEM MODE COLOR CONTROL
+  // ============================
+  if (sysModeText == "JT") {
+    lineColor = GREEN;  // JT = GREEN ring
+  } else {
+    lineColor = GREY;   // SA or any other = GREY ring
+  }
+
+  // Draw outer black filled circle
+  sprite.fillCircle(x, y, r, circleColor);
+
+  // Double rings (colored by sysMode)
+  sprite.drawCircle(x, y, r - 3, lineColor);
+  sprite.drawCircle(x, y, r - 10, lineColor);
+
+  // Draw label in center
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextFont(4);
+  sprite.setTextColor(lineColor, circleColor);
+
+  int ty = y + 2;
+  sprite.drawString(label, x - 1, ty);
+  sprite.drawString(label, x + 1, ty);
+  sprite.drawString(label, x, ty - 1);
+  sprite.drawString(label, x, ty + 1);
+  sprite.drawString(label, x, ty);
+}
+
+void drawModeButton(int x, int y, int w, int h,
+                    const char *label,
+                    uint16_t btnColor)
+{
+    int radius = 10;
+
+    // Shadow (depth effect)
+    sprite.fillRoundRect(x + 3, y + 3, w, h, radius, 0x2104);
+
+    // Outer Frame (COLOR controlled)
+    sprite.fillRoundRect(x, y, w, h, radius, TFT_BLACK);
+    sprite.drawRoundRect(x, y, w, h, radius, btnColor);
+
+    // Inner Panel
+    sprite.fillRoundRect(x + 4, y + 4, w - 8, h - 8, radius - 3, 0x3186);
+
+    // Text (bold font)
+    
+    sprite.setFreeFont(&FreeSansBold18pt7b);  // Set the bold font
+    sprite.setTextDatum(MC_DATUM);
+    sprite.setTextColor(btnColor, 0x3186);
+    sprite.drawString(label, x + w / 2, y + h / 2);
+
+    sprite.setTextDatum(TL_DATUM);
+}
+void drawFirePopup() {
+  // Rectangle parameters
+  int boxW = 220;                           // Width
+  int boxH = 100;                           // Height
+  int boxX = (536 - boxW) / 2;              // Center horizontally
+  int boxY = (240 - boxH) / 2;              // Center vertically
+  int radius = 14;                           // Corner radius
+
+  // Blink state variables
+  static bool blinkState = true;
+  static unsigned long lastBlink = 0;
+  const int blinkInterval = 500;            // Blink every 500ms
+
+  // Handle blinking
+  if (millis() - lastBlink > blinkInterval) {
+    blinkState = !blinkState;
+    lastBlink = millis();
+  }
+
+  // Lava red color (RGB 228,34,23)
+  uint16_t lavaRed = tft.color565(246, 40, 23);
+
+  // Draw filled rounded rectangle
+  sprite.fillRoundRect(boxX, boxY, boxW, boxH, radius, lavaRed);
+
+  // Draw blinking border
+  if (blinkState) {
+    sprite.drawRoundRect(boxX, boxY, boxW, boxH, radius, TFT_WHITE);
+  }
+
+  // Set text
+  sprite.setTextDatum(MC_DATUM);               // Middle Center
+  sprite.setFreeFont(&FreeSansBold18pt7b);     // Bold font
+  sprite.setTextColor(TFT_WHITE, lavaRed);     // White text on lava red
+
+  // Draw centered "FIRE" text
+  sprite.drawString("FIRE", boxX + boxW / 2, boxY + boxH / 2);
+
+  // Reset text datum if needed
+  sprite.setTextDatum(TL_DATUM);
+}
+
+
+
+// ---------------- Layout ----------------
+void drawLayout() {
+  // ===============================
+// 📡 GPS LIVE UPDATE
+// ===============================
+  bool gnssStealth = (digitalRead(gnssPin) == LOW);
+
+  // ===============================
+  // ❌ STEALTH MODE → CLEAR GPS DATA
+  // ===============================
+  if (gnssStealth) {
+    gpsData.hasFix = false;
+    gpsData.dataUpdated = false;
+
+    gpsData.latitude   = 0.0;
+    gpsData.longitude  = 0.0;
+    gpsData.altitude   = 0.0;
+    gpsData.speed_kmph = 0.0;
+    gpsData.course     = 0.0;
+    gpsData.satellites = 0;
+  }
+  // ===============================
+  // 📡 NORMAL MODE → READ GPS
+  // ===============================
+  else {
+    updateGPSData();   // ✅ ONLY HERE
+  }
+
+if (!gnssStealth && gpsData.dataUpdated) {
+
+  // ✅ Store into your UI global strings
+sos_time = String(gpsData.hour) + ":" +
+           (gpsData.minute < 10 ? "0" : "") + String(gpsData.minute);
+  latitude  = String(gpsData.latitude, 6);
+  longitude = String(gpsData.longitude, 6);
+  COG_value = String(gpsData.course, 1);
+  SOG_value = String(gpsData.speed_kmph, 1);
+  HT_value  = String(gpsData.altitude, 6);
+  gpsData.dataUpdated = false;
+
+  // Optional debug
+  // printGPSData();
+}
+
+    sprite.fillSprite(COLOR_BG);
+      bool sosPressed = digitalRead(SOS_PIN);   // HIGH when pressed
+
+
+    // SOS top-left
+     drawGButton_Circle(55, 60, 38);   // x, y, radius
+
+    // GNSS icon next to SOS
+drawGNSSIcon_Target(150, 52, (!gnssStealth && gpsData.hasFix));
+
+int yIcons = 48;
+int yIcons1 = 28;
+int spacingX = 60;
+int iconSize = 90;
+int screenW = 536;
+
+drawBatteryIcon(screenW - 18 - iconSize - 2, yIcons1-1, 90, 54, batteryVoltage);
+
+    // LMU/PMU left of battery
+drawWifiArcIcon(screenW - 18 - iconSize - 2*spacingX + 10,
+                yIcons + 18 - 6,
+                lm1Status ? 4 : 0,
+                "LM1");
+
+drawWifiArcIcon(screenW - 18 - iconSize - spacingX + 12,
+                yIcons + 18 - 6,
+                lm2Status ? 4 : 0,
+                "LM2");
+
+bool pmuStatus = digitalRead(pmuPin) == LOW;   // HIGH = connected
+drawPMURouterIcon(
+  screenW - 18 - iconSize - 3*spacingX -7,
+  yIcons + 18 -16,
+  pmuStatus,
+  "GCM"
+);
+
+// // Bottom row buttons
+// int btnW = 150;
+// int btnH = 70;
+// int gap = 34;
+// int baseX = (screenW - (3*btnW + 2*gap))/2;
+// int baseY = 150;
+
+// Bottom row buttons
+int btnW = 150;
+int btnH = 70;
+int gap = 34;
+int baseX = (screenW - (3*btnW + 2*gap))/2;
+int baseY = 150;
+
+// --- 1st Button (Mode Operation) ---
+drawModeButton(baseX, baseY,
+               btnW, btnH,
+               modeoperation.c_str(),
+               fireBtnColor);    // dynamic color
+
+// --- 2nd Button (System Mode) ---
+drawModeButton(baseX + btnW + gap, baseY,
+               btnW, btnH,
+               sysModeText.c_str(),
+               TFT_GREEN);
+
+// --- 3rd Button (Fire Mode) ---
+drawModeButton(baseX + 2*(btnW + gap), baseY,
+               btnW, btnH,
+               fireMode.c_str(),
+               TFT_GREEN);
+
+// 🔥 FIRE POPUP OVERLAY
+if (firePopupActive) {
+  drawFirePopup();
+}
+
+
+    // Push to screen
+    lcd_PushColors(0, 0, 536, 240, (uint16_t*)sprite.getPointer());
+}
+void drawThunderBolt_Z(int cx, int cy) {
+  uint16_t boltMain  = TFT_YELLOW;
+  uint16_t boltEdge  = TFT_ORANGE;   // subtle outline
+
+  // ---- Main sharp Z lightning (polygon style) ----
+  sprite.fillTriangle(cx - 6,  cy - 22,   cx + 10, cy - 22,   cx - 2,  cy - 4,  boltMain);
+  sprite.fillTriangle(cx + 10, cy - 22,   cx + 2,  cy - 4,    cx + 18, cy - 4,  boltMain);
+
+  sprite.fillTriangle(cx - 2,  cy - 4,    cx + 18, cy - 4,    cx - 6,  cy + 20, boltMain);
+  sprite.fillTriangle(cx + 18, cy - 4,    cx + 2,  cy + 20,  cx + 10, cy + 20, boltMain);
+
+  // ---- Thin outline for professional depth ----
+  sprite.drawTriangle(cx - 6, cy - 22, cx + 10, cy - 22, cx - 2, cy - 4, boltEdge);
+  sprite.drawTriangle(cx - 2, cy - 4,  cx + 18, cy - 4,  cx - 6, cy + 20, boltEdge);
+}
+
+void saveStateLogToEEPROM() {
+
+  static unsigned long lastSave = 0;
+  if (millis() - lastSave < 60000) return;
+  lastSave = millis();
+
+  int addr = 0;
+  uint16_t count = min(300, stateLogWrapped ? STATE_LOG_MAX : stateLogIndex);
+
+  EEPROM.put(addr, count);
+  addr += sizeof(uint16_t);
+
+  for (int i = 0; i < count; i++) {
+    int idx = (stateLogIndex + STATE_LOG_MAX - count + i) % STATE_LOG_MAX;
+    EEPROM.put(addr, stateLog[idx]);
+    addr += sizeof(GNSS_State_Log);
+  }
+
+  EEPROM.commit();
+}
+void convertToIST(int &hour, int &minute, int &second) {
+  minute += 30;
+  hour += 5;
+
+  if (minute >= 60) {
+    minute -= 60;
+    hour += 1;
+  }
+
+  if (hour >= 24) {
+    hour -= 24;
+  }
+}
+
+void printGPSData1() {
+
+  // ---------------- SERIAL PRINT (unchanged) ----------------
+  Serial.printf(
+    "UTC: %02d:%02d:%02d | LAT: %.6f | LON: %.6f | ALT: %.1f m | SOG: %.1f kt | COG: %.1f | SAT: %d | FIX: %s\n",
+    gpsData.hour, gpsData.minute, gpsData.second,
+    gpsData.latitude, gpsData.longitude,
+    gpsData.altitude,
+    gpsData.speed_knots,
+    gpsData.course,
+    gpsData.satellites,
+    gpsData.hasFix ? "YES" : "NO"
+  );
+
+  // ---------------- E22 TRANSMIT ----------------
+  String txMsg = "";
+
+  // Include SOS warning if active
+  if (autoSosWarning && !sosActive) {
+    txMsg += "AUTO_SOS_WARNING,";
+  } else {
+    txMsg += "GPS,";
+  }
+
+  txMsg += String(gpsData.hour) + ":";
+  txMsg += String(gpsData.minute) + ":";
+  txMsg += String(gpsData.second) + ",";
+
+  txMsg += String(gpsData.latitude, 6) + ",";
+  txMsg += String(gpsData.longitude, 6) + ",";
+  txMsg += String(gpsData.altitude, 1) + ",";
+  txMsg += String(gpsData.speed_knots, 1) + ",";
+  txMsg += String(gpsData.course, 1) + ",";
+  txMsg += String(gpsData.satellites) + ",";
+  txMsg += (gpsData.hasFix ? "1" : "0");
+  txMsg += "\n";   // IMPORTANT for RX parsing
+
+  e22.print(txMsg);
+
+  Serial.print("📤 TX: ");
+  Serial.print(txMsg);
+}
+
+void receiveData() {
+  while (e22.available()) {
+    char c = e22.read();
+
+    // Filter out non-printable characters
+    if (isPrintable(c) || c == '\n' || c == '\r') {
+      rxData += c;
+    }
+  }
+
+  // If a complete message is received (newline-terminated)
+  if (rxData.length() > 0 && (rxData.endsWith("\n") || rxData.endsWith("\r"))) {
+    // Remove any extra newline/carriage return
+    rxData.trim();
+
+    if (rxData.length() > 0) {
+      Serial.print("[RX] Received: ");
+      Serial.println(rxData);
+
+      // Visual feedback
+
+    }
+
+    rxData = ""; // Clear buffer
+  }
+}
+
+
+void drawChargingScreen() {
+  sprite.fillSprite(TFT_BLACK);
+
+  // -----------------------------
+  // BATTERY FRAME
+  // -----------------------------
+  int bx = 210;
+  int by = 60;
+  int bw = 110;
+  int bh = 60;
+
+  sprite.drawRoundRect(bx, by, bw, bh, 10, TFT_WHITE);
+  sprite.fillRoundRect(bx + bw + 4, by + bh / 3, 10, bh / 3, 3, TFT_WHITE);
+
+  // Inner dark panel
+  sprite.fillRoundRect(bx + 4, by + 4, bw - 8, bh - 8, 8, 0x3186);
+
+  // -----------------------------
+  // 3 GREEN SEGMENTS
+  // -----------------------------
+  int padding = 10;
+  int gap = 7;
+  int segW = (bw - (2 * padding) - (2 * gap)) / 3;
+  int segH = bh - (2 * padding);
+
+  for (int i = 0; i < 3; i++) {
+    int sx = bx + padding + i * (segW + gap);
+    int sy = by + padding;
+    sprite.fillRoundRect(sx, sy, segW, segH, 5, TFT_GREEN);
+  }
+
+  // -----------------------------
+  // ⚡ Z-SHAPE THUNDER (BETWEEN SEGMENTS)
+  // -----------------------------
+  int boltX = bx + bw / 2;       // center of battery
+  int boltY = by + bh / 2 + 4;  // slightly lower center
+
+  // drawThunderBolt_Z(boltX, boltY);
+
+  // -----------------------------
+  // TEXT
+  // -----------------------------
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextFont(4);
+  sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+  sprite.drawString("CHARGING MODE", 268, 185);
+
+  // -----------------------------
+  // PUSH TO LCD
+  // -----------------------------
+  lcd_PushColors(0, 0, 536, 240,
+                 (uint16_t*)sprite.getPointer());
+}
+
+void drawGNSS_TableScreen() {
+
+  sprite.fillSprite(TFT_BLACK);
+
+  draw3x3Table_MiddleBig(
+     110, 30,
+     70, 280,
+     60, 60,
+     TFT_GREEN
+  );
+
+  drawGNSSIcon_Target(50, 63, digitalRead(gnssPin));
+
+  drawTableLabels(
+     110, 30,
+     70, 280,
+     60, 60
+  );
+
+  lcd_PushColors(
+     0, 0, 536, 240,
+     (uint16_t*)sprite.getPointer()
+  );
+}
+// ===============================
+// BLE BACKGROUND TASK (Core 0)
+// ===============================
+TaskHandle_t bleTaskHandle;
+
+void BLE_Task(void * parameter) {
+
+
+  unsigned long lastReconnectLM1 = 0;
+  unsigned long lastReconnectLM2 = 0;
+  unsigned long lastSendLM1 = 0;
+  unsigned long lastSendLM2 = 0;
+
+  for (;;) {
+    // LMU1 Watchdog
+    if (connectedLM1 && millis() - lastAckTimeLM1 > ACK_TIMEOUT) {
+      connectedLM1 = false;
+      lm1Status = false;
+      ackReceivedLM1 = false;
+    }
+
+    // LMU2 Watchdog
+    if (connectedLM2 && millis() - lastAckTimeLM2 > ACK_TIMEOUT) {
+      connectedLM2 = false;
+      lm2Status = false;
+      ackReceivedLM2 = false;
+    }
+
+    // Auto Reconnect LMU1
+    if (!connectedLM1 && millis() - lastReconnectLM1 > 3000) {
+      lastReconnectLM1 = millis();
+      connectServerLM1();
+    }
+
+    // Auto Reconnect LMU2
+    if (!connectedLM2 && millis() - lastReconnectLM2 > 3000) {
+      lastReconnectLM2 = millis();
+      connectServerLM2();
+    }
+
+    // LMU1 Heartbeat
+    if (connectedLM1 && ackReceivedLM1 && millis() - lastSendLM1 > 2000) {
+      lastSendLM1 = millis();
+      ackReceivedLM1 = false;
+
+      const char* plainText = "LM1_STATUS_OK";
+      char encrypted[128];
+
+      aes.encrypt64(
+        (byte*)plainText,
+        strlen(plainText),
+        encrypted,
+        aes_key,
+        128,
+        aes_iv
+      );
+
+      if (pRxLM1)
+pRxLM1->writeValue(
+  (uint8_t*)plainText,
+  strlen(plainText)
+);
+    }
+
+    // LMU2 Heartbeat
+    if (connectedLM2 && ackReceivedLM2 && millis() - lastSendLM2 > 2000) {
+      lastSendLM2 = millis();
+      ackReceivedLM2 = false;
+
+      const char* plainText = "LM2_STATUS_OK";
+      char encrypted[128];
+
+      aes.encrypt64(
+        (byte*)plainText,
+        strlen(plainText),
+        encrypted,
+        aes_key,
+        128,
+        aes_iv
+      );
+
+      if (pRxLM2)
+pRxLM2->writeValue(
+  (uint8_t*)plainText,
+  strlen(plainText)
+);
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+void setupGPS() {
+  Serial.println("✅ GPS Module Initialized");
+}
+
+void updateGPSData() {
+  while (GPSSerial.available() > 0) {
+    if (gps.encode(GPSSerial.read())) {
+
+      gpsData.hasFix = gps.location.isValid();
+
+      if (gps.location.isValid()) {
+        gpsData.latitude  = gps.location.lat();
+        gpsData.longitude = gps.location.lng();
+      }
+
+      if (gps.altitude.isValid())
+        gpsData.altitude = gps.altitude.meters();
+
+      if (gps.speed.isValid()) {
+        gpsData.speed_knots = gps.speed.knots();
+        gpsData.speed_kmph  = gps.speed.kmph();
+      }
+
+      if (gps.course.isValid())
+        gpsData.course = gps.course.deg();
+
+      if (gps.satellites.isValid())
+        gpsData.satellites = gps.satellites.value();
+
+      if (gps.time.isValid()) {
+        gpsData.hour   = gps.time.hour();
+        gpsData.minute = gps.time.minute();
+        gpsData.second = gps.time.second();
+      }
+
+      gpsData.dataUpdated = true;
+    }
+  }
+}
+
+void printGPSData() {
+  Serial.printf(
+    "UTC: %02d:%02d:%02d | LAT: %.6f | LON: %.6f | ALT: %.1f m | SOG: %.1f kt | COG: %.1f | SAT: %d | FIX: %s\n",
+    gpsData.hour, gpsData.minute, gpsData.second,
+    gpsData.latitude, gpsData.longitude,
+    gpsData.altitude,
+    gpsData.speed_knots,
+    gpsData.course,
+    gpsData.satellites,
+    gpsData.hasFix ? "YES" : "NO"
+  );
+}
+
+// ==================================================
+void sendMessage(String message) {
+
+  Serial.print("[E22 TX] ");
+  Serial.println(message);
+
+  e22.println(message);
+}
+
+// ==================================================
+void sendCommand(String cmd) {
+
+  Serial.print("CMD → ");
+  Serial.println(cmd);
+
+  e22.println(cmd);
+
+  unsigned long t = millis();
+  Serial.print("RESP ← ");
+
+  while (millis() - t < 500) {
+    if (e22.available()) {
+      Serial.write(e22.read());
+      t = millis();
+    }
+  }
+  Serial.println();
+}
+uint8_t getAddressForGroup(uint8_t group) {
+  if (group == 1) return ADDR_G1;
+  if (group == 2) return ADDR_G2;
+  if (group == 3) return ADDR_G3;
+  return 0xFF; // invalid
+}
+uint8_t getSelectedGroup() {
+
+  bool p1 = (digitalRead(PIN1) == LOW);
+  bool p2 = (digitalRead(PIN2) == LOW);
+  bool p3 = (digitalRead(PIN3) == LOW);
+
+  if (p1 && p2 && p3) return 3;   // G3
+  if (p1 && p2)        return 2;   // G2
+  if (p1)              return 1;   // G1
+
+  return 0; // NONE / INVALID
+}
+
+void E22_Receive() {
+
+  static String rxBuffer = "";
+
+  while (e22.available()) {
+    char c = e22.read();
+
+    if (c == '\n') {
+      rxBuffer.trim();
+      if (rxBuffer.length() == 0) {
+        rxBuffer = "";
+        return;
+      }
+
+      Serial.print("📥 RAW ENCRYPTED RX: ");
+      Serial.println(rxBuffer);
+
+      // ===============================
+      // 🔐 FIRST — DECRYPT PACKET
+      // ===============================
+      String decrypted = decryptE22(rxBuffer);
+
+      Serial.print("🔓 DECRYPTED RX: ");
+      Serial.println(decrypted);
+
+      // ===============================
+      // EXPECTED FORMAT AFTER DECRYPT:
+      // ADDR|TYPE|MODE
+      // ===============================
+
+      int p1 = decrypted.indexOf('|');
+      int p2 = decrypted.indexOf('|', p1 + 1);
+
+      if (p1 < 0 || p2 < 0) {
+        Serial.println("❌ Invalid packet format");
+        rxBuffer = "";
+        return;
+      }
+
+      String addrStr = decrypted.substring(0, p1);
+      String type    = decrypted.substring(p1 + 1, p2);
+      String mode    = decrypted.substring(p2 + 1);
+
+      uint8_t rxAddr = strtol(addrStr.c_str(), NULL, 16);
+
+      Serial.print("✅ Packet accepted | ADDR: ");
+      Serial.print(rxAddr, HEX);
+      Serial.print(" | TYPE: ");
+      Serial.print(type);
+      Serial.print(" | MODE: ");
+      Serial.println(mode);
+
+      // ===============================
+      // 🔥 FIRE LOGIC
+      // ===============================
+      if (type == "FIRE") {
+        if (mode == "SEQ" || mode == "CONC") {
+          fireMode = mode;
+        }
+
+        fireNow = true;
+        logStateChange("FIRE_FROM_LORA");
+
+        Serial.print("🔥 FIRE RECEIVED | MODE: ");
+        Serial.println(fireMode);
+
+        if (sysModeText != "SA") {
+          sendFireCommandToLMU();
+        } else {
+          Serial.println("🚫 SYSTEM MODE = SA → NOT sending to LMU");
+        }
+      }
+
+      else if (type == "ACK") {
+        ack_time = "OK";
+      }
+
+      rxBuffer = "";
+    }
+
+    else {
+      rxBuffer += c;
+    }
+  }
+}
+
+
+
+void E22_SendFire() {
+
+  uint8_t group  = getAddressForGroup(getSelectedGroup());  if (group == 0) {
+    Serial.println("❌ FIRE TX blocked (no group)");
+    return;
+  }
+
+  uint8_t addr = getAddressForGroup(group);
+
+  String payload =
+    String(addr, HEX) + "|FIRE|" + fireMode;
+
+  String enc = encryptE22(payload);
+
+  Serial.print("🔥📤 ENCRYPTED FIRE: ");
+  Serial.println(enc);
+
+  e22.println(enc);
+}
+const char *STATE_LOG_FILE = "/state_log.csv";
+
+void saveStateLogToSD(const GNSS_State_Log &e)
+{
+  if (!SD_MMC.begin("/sdcard", true)) return;
+
+  File f = SD_MMC.open(STATE_LOG_FILE, FILE_APPEND);
+  if (!f) {
+    Serial.println("❌ Failed to open SD log file");
+    return;
+  }
+
+String line =
+  String(e.timestamp) + "," +
+  String(e.latitude, 6) + "," +
+  String(e.longitude, 6) + "," +
+  String(e.state);
+
+// Encrypt and save
+String enc = encryptLine(line);
+f.println(enc);
+  f.close();
+  Serial.println("📝 Saved to SD");
+}
+void initLogCounters() {
+  File f;
+
+  f = SD_MMC.open("/cont_log.csv");
+  if(f){ while(f.available()) if(f.read()=='\n') contLines++; f.close(); }
+
+  f = SD_MMC.open("/state_log.csv");
+  if(f){ while(f.available()) if(f.read()=='\n') stateLines++; f.close(); }
+
+  f = SD_MMC.open("/sos_log.csv");
+  if(f){ while(f.available()) if(f.read()=='\n') sosLines++; f.close(); }
+}
+void logContinuous() {
+  if (!SD_MMC.begin("/sdcard", true)) return;
+
+  if (contLines >= CONT_MAX_LOGS) {
+    SD_MMC.remove("/cont_log.csv");
+    contLines = 0;
+  }
+
+  File f = SD_MMC.open("/cont_log.csv", FILE_APPEND);
+  if(!f) return;
+
+  // ----- Build normal CSV line -----
+  String line =
+    String(getCurrentTimeSeconds()) + "," +
+    String(gpsData.latitude, 6) + "," +
+    String(gpsData.longitude, 6) + "," +
+    String(gpsData.speed_kmph, 1) + "," +
+    modeoperation + "," +
+    sysModeText + "," +
+    String(lm1Status) + "," +
+    String(lm2Status);
+
+  // ----- Encrypt the line -----
+  String enc = encryptLine(line);
+
+  // ----- Store encrypted -----
+  f.println(enc);
+
+  f.close();
+  contLines++;
+}
+
+void logSOS_GNSS() {
+
+  if(!sosLoggingActive) return;
+  if (!SD_MMC.begin("/sdcard", true)) return;
+
+  if (sosLines >= SOS_MAX_LOGS) {
+    SD_MMC.remove("/sos_log.csv");
+    sosLines = 0;
+  }
+
+  File f = SD_MMC.open("/sos_log.csv", FILE_APPEND);
+  if(!f) return;
+
+  // -------- Build CSV line --------
+  String line =
+    String(getCurrentTimeSeconds()) + "," +
+    String(gpsData.latitude, 6) + "," +
+    String(gpsData.longitude, 6) + "," +
+    String(gpsData.speed_kmph, 1) + "," +
+    String(gpsData.satellites);
+
+  // -------- Encrypt --------
+  String enc = encryptLine(line);
+
+  // -------- Write encrypted --------
+  f.println(enc);
+
+  f.close();
+  sosLines++;
+}
+void E22_Send_SOS_GNSS()
+{
+  
+  uint8_t addr = SOS_TARGET_ADDR;
+
+  if(addr == 0xFF){
+    Serial.println("❌ SOS address invalid");
+    return;
+  }
+
+  // ======= GNSS Packet =======
+String payload =
+  String(addr, HEX) + "|SOS|" +
+  DEVICE_ID + "|" +
+  String(gpsData.hour) + ":" +
+  String(gpsData.minute) + ":" +
+  String(gpsData.second) + "," +
+  String(gpsData.latitude, 6) + "," +
+  String(gpsData.longitude, 6) + "," +
+  String(gpsData.altitude, 1) + "," +
+  String(gpsData.speed_kmph, 1) + "," +
+  String(gpsData.satellites);
+
+  String enc = encryptE22(payload);
+
+  Serial.print("📤 ENCRYPTED SOS: ");
+  Serial.println(enc);
+
+  e22.println(enc);
+}
+
+// ---------------- Setup ----------------
+void setup() {
+
+  Serial.begin(115200);
+// ✅ Start GPS hardware UART
+GPSSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+setupGPS();
+
+
+Serial.println("\n=== E22-900T33S ESP32 SETUP ===");
+
+delay(100);
+
+// UART2 START
+e22.begin(115200, SERIAL_8N1, E22_RX_PIN, E22_TX_PIN);
+delay(800);
+
+delay(800);
+
+Serial.println("✅ E22 READY (NORMAL MODE)");
+
+
+  pinMode(SOS_PIN, INPUT_PULLUP);
+  pinMode(SYSMODE_PIN, INPUT_PULLUP);
+  pinMode(gnssPin, INPUT_PULLUP);
+  pinMode(pmuPin, INPUT_PULLUP);
+  // pinMode(lmu1Pin, INPUT_PULLUP);
+  // pinMode(lmu2Pin, INPUT_PULLUP);
+  pinMode(TEST_OPS_PIN, INPUT_PULLUP);  
+// INPUT_PULLUP → HIGH = TEST (default), LOW = OPS
+
+  pinMode(CHG_PIN, INPUT_PULLUP);
+  
+  pinMode(FIREMODE_PIN, INPUT_PULLUP);
+  pinMode(FIRE_PIN, INPUT_PULLUP);
+  pinMode(PIN1, INPUT_PULLUP);
+  pinMode(PIN2, INPUT_PULLUP);
+  pinMode(PIN3, INPUT_PULLUP);
+  pinMode(GNSS_PIN, INPUT_PULLUP);
+  pinMode(modeoperationpin, INPUT_PULLUP);
+  // pinMode(LED_SYS_PIN, OUTPUT);
+  // pinMode(LED_PULSE_PIN, OUTPUT);
+  // pinMode(TL_LED_PIN, OUTPUT);
+  // pinMode(FIRE_CONC_LED_PIN, OUTPUT);
+  // digitalWrite(LED_SYS_PIN, LOW);
+  // digitalWrite(LED_PULSE_PIN, LOW);
+  // digitalWrite(TL_LED_PIN, LOW);
+  // digitalWrite(FIRE_CONC_LED_PIN, LOW);
+  
+  // analogReadResolution(12);
+
+  BLEDevice::init("DEFENCE_CLIENT");
+  rm67162_init();
+  lcd_setRotation(1);
+
+  sprite.createSprite(536, 240);
+  sprite.setSwapBytes(true);
+
+// Run BLE logic on Core 0
+xTaskCreatePinnedToCore(
+    BLE_Task,        // Task function
+    "BLE TASK",      // Name
+    8192,            // Stack size
+    NULL,            // Parameter
+    1,               // Priority
+    &bleTaskHandle,  // Task handle
+    0                // Core 0
+);
+
+
+  delay(150);
+   fullScreenDefenseBoot_RectangleLoading();
+  // delay(500);
+  Serial.println("=== SD INIT ===");
+
+if (!SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN)) {
+  Serial.println("❌ SD setPins fail");
+}
+else if (!SD_MMC.begin("/sdcard", true)) {
+  Serial.println("❌ SD Mount Failed");
+}
+else if (SD_MMC.cardType() == CARD_NONE) {
+  Serial.println("❌ No SD Card");
+}
+else {
+  Serial.println("✅ SD Ready");
+}
+initLogCounters();
+  // ✅ USE CHANGE INSTEAD OF FALLING (FIXES ALWAYS-LOW ISSUE)
+  attachInterrupt(digitalPinToInterrupt(SOS_PIN), sosISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(GNSS_PIN), gnssISR, CHANGE);
+
+  //  drawLayout();
+
+}
+
+void loop() {
+
+
+// If BOTH LMUs are disconnected
+if (!connectedLM1 && !connectedLM2) {
+
+  // Start timer only once
+  if (lmuDisconnectStart == 0) {
+    lmuDisconnectStart = millis();
+  }
+
+  // If timeout crossed → LOCK SYSTEM
+  if (millis() - lmuDisconnectStart >= LMU_FAILSAFE_TIMEOUT) {
+    systemLocked = true;
+  }
+
+} else {
+  // Any LMU connected → reset timer
+  lmuDisconnectStart = 0;
+  systemLocked = false;
+}
+
+// ===============================
+// 🔒 SYSTEM LOCKED → BLANK SCREEN
+// ===============================
+if (systemLocked) {
+
+  static unsigned long lastBlink = 0;
+  static bool blinkState = false;
+
+  // ⏱️ Blink timing
+  if (millis() - lastBlink >= 700) {
+    lastBlink = millis();
+    blinkState = !blinkState;
+  }
+
+  sprite.fillSprite(TFT_BLACK);
+
+  if (blinkState) {
+    sprite.setTextDatum(MC_DATUM);
+
+    // 🔥 BIG TEXT (use FreeFont for larger size)
+    sprite.setFreeFont(&FreeSansBold24pt7b);   // ⬅️ BIG FONT
+    sprite.setTextColor(0xC618, TFT_BLACK);    // light grey
+
+    sprite.drawString("TURN OFF", 268, 85);
+    sprite.drawString("DEVICE", 268, 130);
+
+    // 🔹 Small subtitle
+    sprite.setFreeFont(&FreeSansBold12pt7b);
+    sprite.setTextColor(0x8410, TFT_BLACK);    // darker grey
+    sprite.drawString("SYSTEM LOCKED", 268, 200);
+  }
+
+  lcd_PushColors(0, 0, 536, 240, (uint16_t*)sprite.getPointer());
+
+  delay(10);
+  return;
+}
+  // ===============================
+// 🔄 USER ACTIVITY TRACKING
+if (digitalRead(SOS_PIN) == LOW ||
+    digitalRead(FIRE_PIN) == LOW ||
+    digitalRead(GNSS_PIN) == LOW ||
+    digitalRead(SYSMODE_PIN) == LOW ||
+    digitalRead(FIREMODE_PIN) == LOW) {
+
+  lastUserActivityTime = millis();
+  autoSosWarning = false;
+  autoSosTriggered = false;
+  // autoSosWarning = false;
+}
+// ===========// ===============================
+// ⚠️ AUTO SOS WARNING (10 sec before)
+// ===============================
+if (!sosActive &&
+    !autoSosWarning &&
+    !autoSosTriggered &&
+    millis() - lastUserActivityTime >= AUTO_SOS_WARNING_MS) {
+
+  autoSosWarning = true;
+
+  // ✅ ADD THESE LINES
+  autoWarningStartTime = millis();
+  autoWarningLastBlink = millis();
+  autoWarningBlinkState = true;
+
+  // autoSosCountdown = 10;
+  // lastCountdownTick = millis();
+
+  Serial.println("⚠️ AUTO SOS WARNING STARTED");
+}
+
+
+// ====================
+if (autoSosWarning && !sosActive) {
+  drawAutoSOSWarning();
+  lcd_PushColors(0, 0, 536, 240,
+                 (uint16_t*)sprite.getPointer());
+                 delay(150);
+  printGPSData1();   // 👈 send data here
+E22_Send_SOS_GNSS();
+}
+
+
+
+// ===============================
+if (autoSosWarning &&
+    !autoSosTriggered &&
+    (millis() - autoWarningStartTime >= (AUTO_SOS_TIME_MS - AUTO_SOS_WARNING_MS))) {
+
+  autoSosTriggered = true;
+  autoSosWarning   = false;
+
+  sosActive = true;
+  sosLoggingActive = true;
+
+  sosManualTrigger = false;   // ❗ AUTO SOS
+
+  logStateChange("AUTO_SOS_TRIGGERED");
+
+  Serial.println("🚨 AUTO SOS TRIGGERED");
+}
+
+
+// ===============================
+// ❌ AUTO SOS CANCEL (LONG PRESS)
+// ===============================
+
+static unsigned long autoCancelPressStart = 0;
+blockManualSOS = false;
+
+if (autoSosWarning && !autoSosTriggered) {
+
+  static unsigned long cancelStart = 0;
+
+  if (digitalRead(SOS_PIN) == LOW) {
+
+    if (cancelStart == 0)
+      cancelStart = millis();
+
+    if (millis() - cancelStart >= 100) {   // 1 sec hold
+
+      // ✅ FULL RESET
+      autoSosWarning = false;
+      autoSosTriggered = false;
+
+      autoWarningStartTime = 0;
+      autoWarningLastBlink = 0;
+      autoWarningBlinkState = true;
+
+      // autoSosCountdown = 10;
+      // lastCountdownTick = 0;
+
+      lastUserActivityTime = millis();  // 🔑 MOST IMPORTANT
+
+      logStateChange("AUTO_SOS_WARNING_CANCELLED");
+      Serial.println("⚠️ WARNING CANCELLED → TIMER RESET");
+
+      cancelStart = 0;
+    }
+  }
+  else {
+    cancelStart = 0;
+  }
+}
+
+if (!blockManualSOS && !autoSosTriggered) {
+
+  if (digitalRead(SOS_PIN) == LOW) {
+
+    if (sosPressStart == 0) {
+      sosPressStart = millis();
+    }
+
+    if (millis() - sosPressStart >= 1000) {
+
+      sosActive = !sosActive;
+      sosManualTrigger = true;
+      printGPSData1();   // 👈 send data here
+      E22_Send_SOS_GNSS();
+      logStateChange(sosActive ? "SOS_MANUAL_ON" : "SOS_MANUAL_OFF");
+
+      sosPressStart = 0;
+      delay(200);
+    }
+  }
+  else {
+    sosPressStart = 0;
+  }
+}
+
+
+// ===============================
+// 🚨 SOS SCREEN OVERRIDE
+// ===============================
+if (sosActive) {
+  drawSOSScreen(
+    ack_time,
+    sos_time,
+    latitude,
+    longitude,
+    true,
+    sosManualTrigger   
+  );
+  delay(120);
+  return;   // ⛔ HARD LOCK
+}
+
+// ===============================
+// 📡 GNSS TABLE SCREEN (INTERRUPT CONTROLLED)
+// ===============================
+
+// If button is pressed (from ISR)
+if (gnssISR_Pressed) {
+  gnssTempScreenActive = true;        // show immediately
+  gnssScreenReleaseTime = 0;          // cancel any pending auto-off timer
+}
+else if (gnssTempScreenActive) {
+  // Button released → start 5s auto-off timer
+  if (gnssScreenReleaseTime == 0) {
+      logStateChange("GNSS_SCREEN_ON");
+    gnssScreenReleaseTime = millis();
+  }
+
+  if (millis() - gnssScreenReleaseTime >= GNSS_SCREEN_HOLD_MS) {
+    gnssTempScreenActive = false;     // ✅ AUTO OFF
+    gnssScreenReleaseTime = 0;
+    logStateChange("GNSS_SCREEN_OFF");
+  }
+}
+
+// ===============================
+// 📡 GNSS TABLE SCREEN OVERRIDE
+// ===============================
+if (gnssTempScreenActive) {
+  drawGNSS_TableScreen();
+  delay(120);
+  return;   // temporary override (NOT hard lock)
+}
+
+  // ======================================
+  // 1️⃣ BATTERY & CHARGING STATUS
+  // ======================================
+  batteryVoltage = readBatteryVoltage();
+  int batPercent = getBatteryPercent(batteryVoltage);
+  if (batPercent < 15 && !sosActive) {
+  drawLowBatteryScreen(batPercent, batteryVoltage);  // ✅ ONLY LOW BATTERY UI
+  delay(200);
+  return;   // ⛔ BLOCK NORMAL UI
+}
+
+  bool chargingMode = (digitalRead(CHG_PIN) == LOW);
+
+  if (chargingMode) {
+    logStateChange("CHARGING_ON");
+    drawChargingScreen();
+    connected   = false;
+    fireHolding = false;
+    fireExecuted = false;
+    delay(200);
+    return;
+  }
+  int pinState1 = digitalRead(modeoperationpin); // Read the pin
+
+  if (pinState1 == HIGH) {
+    modeoperation = "TM";
+  } else {
+    modeoperation = "TL";
+  }
+   // *********** Detect state change ***********
+  if (modeoperation != lastModeOperation) {
+      logStateChange(modeoperation == "TM" ? "MODE_TM" : "MODE_TL");
+    Serial.print("Mode changed: ");
+    Serial.println(modeoperation);
+
+    // Start 500ms pulse
+    // digitalWrite(LED_PULSE_PIN, HIGH);
+    pulseStart = millis();
+    pulseActive = true;
+
+    lastModeOperation = modeoperation;  // update
+  }
+
+  // *********** Stop pulse after 500ms ***********
+  if (pulseActive && (millis() - pulseStart >= 500)) {
+    // digitalWrite(LED_PULSE_PIN, LOW);
+    pulseActive = false;
+  }
+
+  // *********** LED ON only in TL mode ***********
+  if (modeoperation == "TL") {
+    // digitalWrite(TL_LED_PIN, HIGH);
+  } else {
+    // digitalWrite(TL_LED_PIN, LOW);
+  }
+  
+int sysPinState = digitalRead(SYSMODE_PIN);
+
+if (sysPinState == HIGH && lastSysModeState == LOW &&
+    (millis() - lastSysModePress > debounceSysMs)) {
+
+  lastSysModePress = millis();
+
+  sysModeText = (sysModeText == "SA") ? "JT" : "SA";
+logStateChange(sysModeText == "JT" ? "SYS_JT" : "SYS_SA");
+
+  Serial.print("��️ SysMode: ");
+  Serial.println(sysModeText);
+      // ===== Pulse LED for 500ms on every state change =====
+  // digitalWrite(LED_PULSE_PIN, HIGH);
+  // delay(500);
+  // digitalWrite(LED_PULSE_PIN, LOW);
+  
+}
+// ===== Continuous LED ON only in JT mode =====
+  if (sysModeText == "JT") {
+    // digitalWrite(LED_SYS_PIN, HIGH);
+  } else {
+    // digitalWrite(LED_SYS_PIN, LOW);
+  }
+  
+lastSysModeState = sysPinState;
+
+
+int pinState = digitalRead(FIREMODE_PIN);
+
+if (pinState == HIGH && lastFireModeState == LOW) {
+
+  if (fireMode == "SEQ") {
+    fireMode = "CONC";
+    logStateChange("FIRE_CONC");
+    // 🔴 CONC MODE SELECTED
+    // digitalWrite(FIRE_CONC_LED_PIN, HIGH);
+
+    // 📳 ONE-TIME PULSE using LED_PULSE_PIN
+    // digitalWrite(LED_PULSE_PIN, HIGH);
+    concPulseStart = millis();
+    concPulseActive = true;
+    concPulseDone = true;
+
+  } else {
+    fireMode = "SEQ";
+    logStateChange("FIRE_SEQ");
+    // 🔕 SEQ MODE
+    // digitalWrite(FIRE_CONC_LED_PIN, LOW);
+    concPulseDone = false;
+  }
+
+  Serial.print("🔥 Fire Mode Changed: ");
+  Serial.println(fireMode);
+}
+
+lastFireModeState = pinState;
+
+
+
+bool firePressed = (digitalRead(FIRE_PIN) == LOW);  // INPUT_PULLUP → LOW = pressed
+
+bool fireSwitchAllowed =
+(
+   (modeoperation == "TL") || 
+   (modeoperation == "TM" && sysModeText == "SA")
+) &&
+(label == "G1" || label == "G2" || label == "G3") &&
+(fireMode == "SEQ" || fireMode == "CONC");
+
+// 🔹 Popup handling (visual only)
+handleFirePopup(firePressed, fireSwitchAllowed);
+
+// ===============================
+// 🔥 FIRE LONG PRESS (2 SEC)
+// ===============================
+static bool fireSentOnce = false;
+
+if (firePressed && fireSwitchAllowed) {
+
+  if (firePressStart == 0) {
+    firePressStart = millis();
+    fireSentOnce = false;   // reset for new press
+  }
+
+  // ⏱️ 2 SECOND HOLD CONFIRMED
+  if (!fireSentOnce &&
+      millis() - firePressStart >= FIRE_LONG_PRESS_MS) {
+
+  if (modeoperation == "TL") {
+
+      if (sysModeText == "SA") {
+
+          // TL + SA → BLE ONLY
+          sendFireCommandToLMU();
+
+          Serial.println("🔥 FIRE TL-SA → BLE ONLY (Leg Mount)");
+          logStateChange("FIRE_TL_SA");
+
+      }
+      else if (sysModeText == "JT") {
+
+          // TL + JT → BLE + LORA
+          sendFireCommandToLMU();
+          E22_SendFire();
+
+          Serial.println("🔥 FIRE TL-JT → BLE + LORA");
+          logStateChange("FIRE_TL_JT");
+      }
+  }
+
+  else if (modeoperation == "TM") {
+
+      if (sysModeText == "SA") {
+
+          // TM + SA → BLE ONLY
+          sendFireCommandToLMU();
+
+          Serial.println("🔥 FIRE TM-SA → BLE ONLY");
+          logStateChange("FIRE_TM_SA");
+      }
+
+      else if (sysModeText == "JT") {
+          E22_Receive();   // 👂 always listening
+
+          // TM + JT → NO TRANSMIT
+          Serial.println("⚠ TM-JT MODE → FIRE BLOCKED (RX ONLY)");
+          logStateChange("FIRE_TM_JT_BLOCKED");
+      }
+  }
+    // 🔴 Fire popup visuals
+    firePopupActive = true;
+    firePopupStart  = millis();
+    fireLastBlink   = millis();
+    fireBlinkState  = true;
+
+    fireSentOnce = true;   // 🔒 ONE-SHOT
+  }
+}
+else {
+  // 🔁 Reset on release or mode change
+  firePressStart = 0;
+  fireSentOnce   = false;
+}
+
+// ===============================
+// 🔴 FIRE POPUP BLINK / AUTO-HIDE
+// ===============================
+if (firePopupActive) {
+
+  if (millis() - fireLastBlink >= FIRE_BLINK_INTERVAL) {
+    fireBlinkState = !fireBlinkState;
+    fireLastBlink = millis();
+  }
+
+  if (millis() - firePopupStart >= FIRE_POPUP_SHOW_MS) {
+    firePopupActive = false;
+    fireBlinkState  = false;
+  }
+}
+
+// ===============================
+// 🔁 CONC MODE PULSE AUTO-OFF
+// ===============================
+if (concPulseActive && (millis() - concPulseStart >= CONC_PULSE_MS)) {
+  // digitalWrite(LED_PULSE_PIN, LOW);
+  concPulseActive = false;
+}
+
+// 🔁 Auto OFF pulse after fixed time
+if (concPulseActive && (millis() - concPulseStart >= CONC_PULSE_MS)) {
+  // digitalWrite(LED_PULSE_PIN, LOW);
+  concPulseActive = false;
+}
+
+// ===============================
+// 📡 GNSS SEARCHING SCREEN
+// ===============================
+// if (!gpsData.hasFix && !gnssStealth && !sosActive) {
+
+//   drawGNSSSearchingScreen();
+//   delay(200);
+
+//   return;   // block normal UI until fix
+// }
+
+   drawLayout();
+   // ===============================
+// 📡 E22 TX / RX SLOT SYSTEM
+// ===============================
+static unsigned long lastSOS = 0;
+if(sosLoggingActive && millis() - lastSOS >= 1000){
+  lastSOS = millis();
+  logSOS_GNSS();
+}
+
+
+//   saveStateLogToEEPROM();
+static unsigned long lastCont = 0;
+if(millis() - lastCont >= 1000){
+  lastCont = millis();
+  logContinuous();
+}
+
+E22_Receive();   // 👂 always listening
+  // updateGPSData();
+
+  // if (gpsData.hasFix) {
+  //   printGPSData();
+  // } else {
+  //       printGPSData();
+
+  //   Serial.println("❌ GPS FIX NOT AVAILABLE");
+  // }
+
+  delay(120);
+}
